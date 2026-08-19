@@ -1,0 +1,1076 @@
+
+import os
+import glob
+import glob
+import cv2
+import shutil
+from pathlib import Path
+from time import sleep
+import numpy as np
+from osgeo import gdal, ogr, osr
+from datasets.DataUtils import DataUtils
+from torch.utils.data import get_worker_info
+import shutil
+import random
+import torch
+
+from torch.autograd import Variable as V
+from torch.utils import data
+from torchvision import transforms as T
+import torch.multiprocessing as mp
+from shapely.geometry import Polygon
+from shapely.ops import transform as shapely_transform
+import pyproj
+
+from tqdm import tqdm
+from networks.GenerateNet import GenerateNet
+from utils.hist_stretch import percent_stretch_image
+from config import cfg
+from multiprocessing import Pool, cpu_count, get_context
+from functools import partial
+
+import warnings
+warnings.filterwarnings('ignore')
+from utils.paek_smooth import smooth_polygons_gdf_used
+from schedule import post_status, post_progress
+
+
+from secure.SecureCheck import secure_check
+secure_check()
+
+def CalHistogram(img):
+    
+    img_dtype = img.dtype
+    img_hist = img.reshape(-1)
+    img_min, img_max = img_hist.min(), img_hist.max()
+    n_bins = 2 ** 16
+    if (img_dtype == np.uint8 ):
+        n_bins = 256
+    if  (img_dtype == np.uint16 ):
+        n_bins = 2**16
+    elif (img_dtype == np.uint32):
+        n_bins = 2**32 
+    if (img_dtype == np.uint8 ) or (img_dtype == np.uint16 ) or (img_dtype == np.uint32):
+        hist = np.bincount(img_hist, minlength = n_bins)
+        hist[0] = 0  
+        hist[-1] = 0    
+        s_values = np.arange(n_bins)
+    else:
+        hist,s_values= np.histogram(img_hist,bins = n_bins,range = (img_min,img_max)) 
+        hist[0] = 0
+        hist[-1] = 0   
+    img_hist = None  
+    return hist, s_values
+
+def GetPercentStretchValue(img,left_clip = 0.001,right_clip = 0.001):
+    
+    right_clip = 1.0 - right_clip
+    hist, s_values = CalHistogram(img)
+    s_quantiles = np.cumsum(hist).astype(np.float64)
+    s_quantiles /= (s_quantiles[-1] + 1.0E-5)    
+    left_clip_index = np.argmin(np.abs(s_quantiles-left_clip))
+    right_clip_index = np.argmin(np.abs(s_quantiles-right_clip))  
+    img_min_clip,img_max_clip = s_values[[left_clip_index,right_clip_index]]
+    return img_min_clip,img_max_clip 
+
+def percent_stretch_image1(input_image_data, left_clip = 0.001,right_clip = 0.001):
+    
+    if input_image_data is None:
+        return None  
+    n_dim = input_image_data.ndim
+    img_bands = 1 if n_dim == 2 else input_image_data.shape[n_dim-1]
+    xsize = input_image_data.shape[1]
+    ysize = input_image_data.shape[0]
+    indtype = input_image_data.dtype
+    if indtype == np.uint8:
+        to_8bit = True
+    if img_bands > 1:
+        out_8bit_data = np.zeros((ysize,xsize,img_bands),dtype = np.uint8)
+    else:
+        out_8bit_data = np.zeros((ysize,xsize),dtype = np.uint8)  
+    for i_band in range(img_bands):
+        if img_bands == 1:
+            input_image_data_raw = input_image_data#[:,:,i_band]
+        else:
+            input_image_data_raw = input_image_data[:,:,i_band]
+        img_clip_min,img_clip_max = GetPercentStretchValue(input_image_data_raw,left_clip=left_clip,right_clip = right_clip)    
+        input_image_data_raw = np.clip(input_image_data_raw,img_clip_min,img_clip_max)
+        input_image_data_raw = (input_image_data_raw -  img_clip_min)/(img_clip_max - img_clip_min) * 255
+        input_image_data_raw = input_image_data_raw.astype(np.uint8)               
+        if img_bands > 1:
+            out_8bit_data[:,:,i_band] = input_image_data_raw
+        else:
+            out_8bit_data = input_image_data_raw
+    return out_8bit_data
+
+
+def truncated_linear_stretch(image, truncated_value=2):
+    """无符号整型16位转无符号整型8位程序
+    @author: Xiangyu Tian
+
+    Args:
+        image (numpy.ndarray): 影像矩阵信息
+        truncated_value (int): np.percentile函数的百分比信息
+
+    Returns:
+        image_stretch (numpy.ndarray): 转8位之后的矩阵
+    """
+    # 如果是多波段
+    if(len(image.shape) == 3):
+        image_stretch = np.zeros([image.shape[0],image.shape[1],image.shape[2]])
+        image_stretch = np.uint16(image_stretch)
+        for i in range(1):
+            gray = gray_process(image[:,:,i], truncated_value)
+            image_stretch[:,:,i] = gray
+        image_stretch = np.array(image_stretch)
+    # 如果是单波段
+    else:
+        image_stretch = gray_process(image, truncated_value)
+    return image_stretch
+
+def gray_process(gray, truncated_value, max_out = 255, min_out = 0):
+    """无符号整型16位转无符号整型8位程序 单波段应用
+    @author: Xiangyu Tian
+
+    Args:
+        image (numpy.ndarray): 影像矩阵信息
+        truncated_value (int): np.percentile函数的百分比信息
+
+    Returns:
+        gray (numpy.ndarray): 转8位之后的矩阵
+    """
+    temp = gray.copy()
+    if np.all(gray==0):
+        return gray
+    temp = temp.ravel()[np.flatnonzero(temp)]
+    if temp.shape[0] == 0:
+        import pdb;pdb.set_trace()
+    truncated_down = np.percentile(temp, truncated_value)
+    truncated_up = np.percentile(temp, 100 - truncated_value)
+    gray = (gray - truncated_down) / (truncated_up - truncated_down) * (max_out - min_out) + min_out
+    gray[gray < min_out] = min_out
+    gray[gray > max_out] = max_out
+    if(max_out <= 255):
+        gray = np.uint8(gray)
+    elif(max_out <= 65535):
+        gray = np.uint16(gray)
+    return gray
+
+# gdal读取图像
+def readimage(dataset, read_range):
+    nband = dataset.RasterCount
+    band_list = [i + 1 for i in range(nband)]
+    if nband == 3 or nband == 4:
+        band_list[0] = 3
+        band_list[2] = 1
+    img = None
+    count, addition = 0  ,100 // len(band_list)
+    # import ipdb;ipdb.set_trace()
+    for band in band_list:
+        _data = dataset.GetRasterBand(band)
+        _img = _data.ReadAsArray(*read_range)[:, :, None]
+        if 'int16' in _img.dtype.name:
+            if _img.max() == 0:
+                _img = _img.astype(np.uint8)
+            else:
+                _img = truncated_linear_stretch(image=_img)
+                _img = _img.astype(np.uint8)
+        if img is not None:
+            img = np.append(img, _img, axis=2)
+        else:
+            img = _img
+        count += addition
+    if img.shape[2] == 1:
+        img = img[:, :, 0]
+    return img
+
+def mask_nodata(pre_img, post_img):
+    if pre_img.min() == 255 or post_img.min() == 255:
+        return np.zeros((pre_img.shape[0], pre_img.shape[1]), dtype=pre_img.dtype)
+    # import ipdb; ipdb.set_trace()
+    assert pre_img.shape == post_img.shape
+    # 任意一张是nodata就应该被掩盖掉
+    temp = pre_img * post_img  # [3,1024,1024]
+    mask = np.where(np.mean(temp, axis=2)==0, 0, 1)
+    return mask
+
+def style_transfer(source_image, target_image):
+    h, w, c = source_image.shape
+    out = []
+    for i in range(c):
+        source_image_f = np.fft.fft2(source_image[:,:,i])
+        source_image_fshift = np.fft.fftshift(source_image_f)
+        target_image_f = np.fft.fft2(target_image[:,:,i])
+        target_image_fshift = np.fft.fftshift(target_image_f)
+        
+        change_length = 1
+        source_image_fshift[int(h/2)-change_length:int(h/2)+change_length, 
+                            int(h/2)-change_length:int(h/2)+change_length] = \
+            target_image_fshift[int(h/2)-change_length:int(h/2)+change_length,
+                                int(h/2)-change_length:int(h/2)+change_length]
+            
+        source_image_ifshift = np.fft.ifftshift(source_image_fshift)
+        source_image_if = np.fft.ifft2(source_image_ifshift)
+        source_image_if = np.abs(source_image_if)
+        
+        source_image_if[source_image_if>255] = np.max(source_image[:,:,i])
+        out.append(source_image_if)
+    out = np.array(out)
+    out = out.swapaxes(1,0).swapaxes(1,2)
+    
+    # # 结果中含有>255的值,拉伸或者强制=255效果都不好,但是cv2.imwrite再read效果好
+    # # 有时间探究一下原因
+    # # 生成数字+字母
+    # token = string.ascii_letters + string.digits
+    # # 随机选择指定长度随机码
+    # token = random.sample(token,15)
+    # token_str = ''.join(token)
+    # temp_path = "temp_{}.png".format(token_str)
+    # if not os.path.exists(temp_path): cv2.imwrite(temp_path, out)
+    # out = cv2.imread(temp_path)
+    # if os.path.exists(temp_path): os.remove(temp_path)
+    out = out.astype(np.uint8)
+    return out
+
+
+def get_union_extent(gt1, gt2, size1, size2):
+    # 要求统一投影
+    xmin1 = gt1[0]
+    ymax1 = gt1[3]
+    xmax1 = xmin1 + gt1[1] * size1[0]
+    ymin1 = ymax1 + gt1[5] * size1[1]
+
+    xmin2 = gt2[0]
+    ymax2 = gt2[3]
+    xmax2 = xmin2 + gt2[1] * size2[0]
+    ymin2 = ymax2 + gt2[5] * size2[1]
+
+    xmin = max(xmin1, xmin2)
+    ymin = min(ymin1, ymin2)
+    xmax = min(xmax1, xmax2)
+    ymax = max(ymax1, ymax2)
+    return xmin, ymin, xmax, ymax
+
+def fill_hole(shp_file_path, output_shp_file_name):
+    """
+    @function: 检查shp文件中Polygon的内环部分进行填充；（在原shp文件的同级目录下生成一个新的名为output_shp_file_name的shp文件）
+    @description:
+    * 直接判断Polygon里面包含的Shape数量，是2的话就是包含内外环，获取外环重新构建一个多边形；
+    @params:
+    * output_shp_file_name: 输出的shp文件名，不要加.shp后缀
+    @return:
+    * None
+    """
+    gdal.SetConfigOption("SHAPE_ENCODING", "")
+    driver = ogr.GetDriverByName("ESRI Shapefile")
+    shp_file_path = Path(shp_file_path)
+    datasource = driver.Open(str(shp_file_path), 1)
+    output_shp_file_name = Path(output_shp_file_name)
+    if output_shp_file_name.exists():
+        driver.DeleteDataSource(str(output_shp_file_name))
+    layer = datasource.GetLayer()
+    src_srs = layer.GetSpatialRef()  # 获取原始的坐标系或投影
+    tgt_srs = osr.SpatialReference()  # 获取目标的坐标系或投影， web mercator
+    # tgt_srs.ImportFromEPSG(3857)
+    tgt_srs.ImportFromWkt(src_srs.ExportToWkt())
+    transform = osr.CoordinateTransformation(src_srs, tgt_srs)
+
+    tgt_datasource = driver.CreateDataSource(str(output_shp_file_name))
+    tgt_geomtype = ogr.wkbPolygon
+    tgt_layer = tgt_datasource.CreateLayer(str(output_shp_file_name), srs=tgt_srs, geom_type=tgt_geomtype, options=["ENCODING=GBK"])
+    layerDefinition = layer.GetLayerDefn()  # 获取图层的字段信息
+    for i in range(layerDefinition.GetFieldCount()):
+        tgt_layer.CreateField(layerDefinition.GetFieldDefn(i))
+
+    # feature = layer.GetFeature(396)
+    # geom = feature.GetGeometryRef()
+    # from ipdb import set_trace; set_trace()
+    for feature in layer:
+        geom = feature.GetGeometryRef()
+        geom_tgt = geom.Clone()
+        # geom_tgt.Transform(transform)
+        if geom_tgt.GetGeometryCount() < 2:
+            feature.SetGeometry(geom_tgt)
+            tgt_layer.CreateFeature(feature)
+        else:
+            geom_out_ring = geom_tgt.GetGeometryRef(0)
+            geom_tgt_polygon = ogr.Geometry(ogr.wkbPolygon)
+            geom_tgt_polygon.AddGeometry(geom_out_ring)
+            feature.SetGeometry(geom_tgt_polygon)
+            tgt_layer.CreateFeature(feature)
+
+    datasource.Destroy()
+    tgt_datasource.Destroy()
+
+def simplify_preserve_toplogy(shp_file_path, output_shp_file_name, tolerance):
+        """
+        @function: 简化多边形
+        @description:
+        * None；
+        @params:
+        * output_shp_file_name: 输出的shp文件名，不限制
+        * tolerance：阈值
+        @return:
+        * None
+        """
+        # print(f'当前容差是： {tolerance}')
+        gdal.SetConfigOption("SHAPE_ENCODING", "")
+        driver = ogr.GetDriverByName("ESRI Shapefile")
+        shp_file_path = Path(shp_file_path)
+        datasource = driver.Open(str(shp_file_path), 1)
+        output_shp_file_name = Path(output_shp_file_name)
+        if output_shp_file_name.suffix == '':
+            output_shp_file_name = output_shp_file_name.with_suffix('.shp')
+        if len(output_shp_file_name.parts) == 1:
+            output_shp_file_name = shp_file_path.parent / output_shp_file_name
+        if output_shp_file_name.exists():
+            driver.DeleteDataSource(str(output_shp_file_name))
+        layer = datasource.GetLayer()
+        src_srs = layer.GetSpatialRef()  # 获取原始的坐标系或投影
+        tgt_srs = osr.SpatialReference()  # 获取目标的坐标系或投影， web mercator
+        tgt_srs.ImportFromWkt(src_srs.ExportToWkt())
+
+        tgt_datasource = driver.CreateDataSource(str(output_shp_file_name))
+        tgt_geomtype = ogr.wkbPolygon
+        tgt_layer = tgt_datasource.CreateLayer(str(output_shp_file_name), srs=tgt_srs, geom_type=tgt_geomtype,
+                                               options=["ENCODING=GBK"])
+        layerDefinition = layer.GetLayerDefn()  # 获取图层的字段信息
+        for i in range(layerDefinition.GetFieldCount()):
+            tgt_layer.CreateField(layerDefinition.GetFieldDefn(i))
+
+        for feature in layer:
+            geom = feature.GetGeometryRef()
+            geom_tgt = geom.Clone()
+            geom_tgt = geom_tgt.SimplifyPreserveTopology(tolerance)
+            feature.SetGeometry(geom_tgt)
+            tgt_layer.CreateFeature(feature)
+
+        datasource.Destroy()
+        tgt_datasource.Destroy()
+        # print(f'{output_shp_file_name} 创建完成...')
+
+class OnlineDataset(data.Dataset):
+    """Dataloader
+
+    节省内存提高预测效率
+    """
+    
+    def __init__(self, path_info, band_num, with_fft):
+        super(OnlineDataset, self).__init__()
+        self.path_info = path_info
+        self.preimg_path = self.path_info['preImgPath']
+        self.postimg_path = self.path_info['postImgPath']
+        self.index_list = self.path_info['index_list']
+        self.overlap = self.path_info['overlap']
+        self.clipsize = self.path_info['clipsize']
+        self.with_fft = with_fft
+        self.predataset = {} # gdal.Open(self.preimg_path)
+        self.postdataset = {} # gdal.Open(self.postimg_path)
+        self.band_num = band_num
+        self.datautils = DataUtils()
+        mean_file = self.path_info['mean_file']
+        std_file = self.path_info['std_file']
+        """这里需要加入读取均值方差的功能"""
+        # self.mean_value = [0.26069229475394134, 0.298781168513767, 0.2869695704458281, 0.434965101964887]
+        # self.std_value = [0.055944613439789126, 0.062278333852758584, 0.07335243334796868, 0.1069423216555217]
+        self.mean_value =  self.datautils.load_mean_file(mean_file)
+        self.std_value =  self.datautils.load_std_file(std_file)
+        normalize = T.Normalize(mean=self.mean_value, std=self.std_value)
+        self.transforms = T.Compose([
+            T.ToTensor(),
+            normalize
+        ])
+
+    def __getitem__(self, index):
+        # 根据计算好索引列表读取对应区域的影像切片（前时相）
+        clip_x, clip_y, pad_x_right, pad_y_down = self.index_list[index]
+        
+        clipsize_x, clipsize_y = self.clipsize[0], self.clipsize[1]
+        # 根据index坐标索引读取小块图像
+        if clip_x != 0 and self.overlap[0] > 0:
+            clip_x = clip_x - self.overlap[0] // 2
+        elif clip_x == 0:
+            clipsize_x = self.clipsize[0] - self.overlap[0] // 2
+        if clip_y != 0 and self.overlap[1] > 0:
+            clip_y = clip_y - self.overlap[1] // 2
+        elif clip_y == 0:
+            clipsize_y = self.clipsize[1] - self.overlap[1] // 2
+        if pad_x_right > 0:
+            clipsize_x = self.clipsize[0] - int(pad_x_right)
+        else:
+            pad_x_right = 0
+        if pad_y_down > 0:
+            clipsize_y = clipsize_y - int(pad_y_down)
+        else:
+            pad_y_down = 0
+
+        # 惰性加载大图数据，每个进程只打开一次
+        worker_info = get_worker_info()
+        key = 'main' if worker_info is None else f'worker_{worker_info.id}'
+
+        if key not in self.predataset:
+            pre_ds = gdal.Open(self.preimg_path, gdal.GA_ReadOnly)
+            if pre_ds is None:
+                raise RuntimeError(f"GDAL failed to open {self.preimg_path}")
+            post_ds = gdal.Open(self.postimg_path, gdal.GA_ReadOnly)
+            if post_ds is None:
+                raise RuntimeError(f"GDAL failed to open {self.postimg_path}")
+            self.predataset[key] = pre_ds
+            self.postdataset[key] = post_ds
+            
+        # import ipdb;ipdb.set_trace()
+        # 处理大图的尺寸不足以裁剪出一块切片的时候
+        big_width, big_height = self.predataset[key].RasterXSize, self.predataset[key].RasterYSize
+        if clipsize_x > big_width:
+            clipsize_x = big_width
+            pad_x_right = pad_x_right + clipsize_x - big_width
+            self.index_list[index][2] = pad_x_right
+        if clipsize_y > big_height:
+            clipsize_y = big_height
+            pad_y_down = pad_y_down + clipsize_y - big_height
+            self.index_list[index][3] = pad_y_down
+
+        pre_img = readimage(self.predataset[key], (clip_x, clip_y, clipsize_x, clipsize_y))[:,:,0:self.band_num]
+        # import ipdb;ipdb.set_trace()
+        post_img = readimage(self.postdataset[key], (clip_x, clip_y, clipsize_x, clipsize_y))[:,:,0:self.band_num]
+
+        # 交换得到正确的RGB图像
+        # pre_img = pre_img[..., [i - 1 for i in self.path_info['rgb']]]
+        # post_img = post_img[..., [i - 1 for i in self.path_info['rgb']]]
+        
+        # 处理边缘
+        if clip_x == 0 and clip_y != 0:
+            pre_img = np.pad(pre_img, ((0,int(pad_y_down)), (self.overlap[1]//2, int(pad_x_right)), (0,0)))
+            post_img = np.pad(post_img, ((0,int(pad_y_down)), (self.overlap[1]//2, int(pad_x_right)), (0,0)))
+        elif clip_x == 0 and clip_y == 0:
+            pre_img = np.pad(pre_img, ((self.overlap[0]//2,int(pad_y_down)), (self.overlap[1]//2, int(pad_x_right)), (0,0)))
+            post_img = np.pad(post_img, ((self.overlap[0]//2,int(pad_y_down)), (self.overlap[1]//2, int(pad_x_right)), (0,0)))
+        elif clip_x != 0 and clip_y == 0:
+            pre_img = np.pad(pre_img, ((self.overlap[0]//2, int(pad_y_down)), (0,int(pad_x_right)), (0,0)))
+            post_img = np.pad(post_img, ((self.overlap[0]//2, int(pad_y_down)), (0,int(pad_x_right)), (0,0)))
+        else:
+            pre_img = np.pad(pre_img, ((0, int(pad_y_down)), (0,int(pad_x_right)), (0,0)))
+            post_img = np.pad(post_img, ((0, int(pad_y_down)), (0,int(pad_x_right)), (0,0)))
+
+        # 若由于分辨率差异或者进位错误导致两张切片图像的尺寸不一致，将后时相影像尺寸转为前时相影像的尺寸
+        # if pre_img.shape != post_img.shape:
+        #     post_img = cv2.resize(post_img, (pre_img.shape[1], pre_img.shape[0]), interpolation=cv2.INTER_NEAREST)
+        # cv2.imwrite('./test/' + pre_name+ '.png', np.concatenate((pre_img, post_img), axis=1).astype(np.uint8))
+        nodata_mask = mask_nodata(pre_img, post_img)
+        # use FFT
+        if self.with_fft:
+            pre_img = style_transfer(pre_img, post_img)
+        # percentage strech
+        if False:
+            pre_img = percent_stretch_image(pre_img)
+            post_img = percent_stretch_image(post_img)
+        # 影像规则化
+        pre_img = self.transforms(np.ascontiguousarray(pre_img, dtype = np.uint8))
+        post_img = self.transforms(np.ascontiguousarray(post_img, dtype = np.uint8))
+
+        return pre_img, post_img, nodata_mask, self.index_list[index]
+
+    def __len__(self):
+        return len(self.index_list)
+
+def get_extent(ds):
+    gt = ds.GetGeoTransform()
+    xsize, ysize = ds.RasterXSize, ds.RasterYSize
+    xmin = gt[0]
+    ymax = gt[3]
+    xmax = xmin + gt[1] * xsize
+    ymin = ymax + gt[5] * ysize
+    return xmin, ymin, xmax, ymax
+
+def get_polygon_from_extent(extent):
+    xmin, ymin, xmax, ymax = extent
+    return Polygon([
+        (xmin, ymin),
+        (xmax, ymin),
+        (xmax, ymax),
+        (xmin, ymax),
+        (xmin, ymin)
+    ])
+
+def get_srs(ds):
+    srs = osr.SpatialReference()
+    srs.ImportFromWkt(ds.GetProjection())
+    return srs
+
+def transform_polygon(polygon, src_srs, dst_srs):
+    try:
+        project = pyproj.Transformer.from_crs(
+            pyproj.CRS.from_wkt(src_srs.ExportToWkt()),
+            pyproj.CRS.from_wkt(dst_srs.ExportToWkt()),
+            always_xy=True
+        ).transform
+        return shapely_transform(project, polygon)
+    except Exception as e:
+        print("投影转换失败：", e)
+        return None
+
+def get_pixel_offset(dataset, x_geo, y_geo):
+    gt = dataset.GetGeoTransform()
+    col = int((x_geo - gt[0]) / gt[1])
+    row = int((y_geo - gt[3]) / gt[5])
+    return row, col
+
+def compute_intersection_info(ds1, ds2):
+
+    bounds1 = get_extent(ds1)
+    bounds2 = get_extent(ds2)
+
+    # 计算空间交集 (left, bottom, right, top)
+    overlap_left = max(bounds1[0], bounds2[0])
+    overlap_right = min(bounds1[2], bounds2[2])
+    overlap_bottom = max(bounds1[1], bounds2[1])
+    overlap_top = min(bounds1[3], bounds2[3])
+
+    if overlap_left >= overlap_right or overlap_bottom >= overlap_top:
+        print("❌ 两幅图像无空间交集")
+        return None
+
+    # 左上角在两张图中的像素位置
+    row1, col1 = get_pixel_offset(ds1, overlap_left, overlap_top)
+    row2, col2 = get_pixel_offset(ds2, overlap_left, overlap_top)
+
+    # 获取像素大小（单位：米或度）
+    pixel_width = ds1.GetGeoTransform()[1]
+    pixel_height = abs(ds1.GetGeoTransform()[5])
+
+    # 计算交集区域的像素尺寸
+    width_px = int((overlap_right - overlap_left) / pixel_width)
+    height_px = int((overlap_top - overlap_bottom) / pixel_height)
+
+    return {
+        "offset_img1": (row1, col1),
+        "offset_img2": (row2, col2),
+        "size": (height_px, width_px),
+        "bounds": (overlap_left, overlap_bottom, overlap_right, overlap_top)
+    }
+
+def generate_indexlist(width, height, ori_w=0, ori_h=0, subsize=(512, 512), overlap=(0, 0), debug=False):
+    """
+    Args:
+       width: width of the input big tif 
+       height: height of the input big tif 
+       ori_w: starting width of the input big tif 
+       ori_h: starting height of the input big tif 
+       subsize: clip size
+       overlap: overlap between two clips
+    Return:
+        params_saveimg: saves a tuple, the content is:
+            (the start position of left, the start position of up, 
+            the pixels to be padded in right, the pixels to be padded in bottom)
+        nx & ny: the number of patches in one row & col
+    """
+    overlap_half_x = overlap[0] // 2
+    overlap_half_y = overlap[1] // 2
+    slide_x = subsize[0] - overlap[0]
+    slide_y = subsize[1] - overlap[1]
+    params_saveimg = []
+    left= 0
+    nx = 0
+    while left < width:
+        if debug:
+            import ipdb;ipdb.set_trace()
+        if left + slide_x + overlap_half_x > width:
+            pad_x_right = left + slide_x + overlap_half_x - width
+        elif left + slide_x + overlap_half_x == width:
+            pad_x_right = -1
+        else:
+            pad_x_right = 0
+        up = 0
+        ny = 0
+        while up < height:
+            if up + slide_y + overlap_half_y > height:
+                pad_y_down = up + slide_y + overlap_half_y - height
+            elif up + slide_y + overlap_half_y == height:
+                pad_y_down = -1
+            else:
+               pad_y_down = 0
+            clip_left = left + ori_w
+            clip_up = up + ori_h
+            params_saveimg.append([clip_left, clip_up, pad_x_right, pad_y_down])
+            up = up + slide_y
+            ny += 1
+        left = left + slide_x
+        nx += 1
+    return params_saveimg, nx, ny
+
+def test_with_TTA(net, imgs, num_classes, device):
+    im_bs = imgs.shape[0] // 8
+    
+    images = torch.Tensor(imgs).to(device)
+
+    with torch.no_grad():
+        scores = net(images)
+        
+    if num_classes > 1:
+        output_change = torch.softmax(scores[0], axis=1)[:,1].cpu().numpy()
+    else:
+        output_change = torch.sigmoid(scores[0])[:,0].cpu().numpy()
+    
+    mask_change = output_change[0:im_bs*2] + output_change[im_bs*2:im_bs*4][:,::-1] + output_change[im_bs*4:im_bs*6][:,:,::-1] + output_change[im_bs*6:][:,::-1,::-1]
+    mask_change = mask_change[0:im_bs] + np.rot90(mask_change[im_bs:], axes = (1, 2))[:,::-1,::-1]
+    mask_change = np.rint(mask_change/8).astype(np.uint8)
+    return mask_change
+
+def test_normal(net, imgs, num_classes, device):
+    images = torch.Tensor(imgs).to(device)
+    with torch.no_grad():
+        scores = net(images)
+    if num_classes > 1:
+        output_change = torch.softmax(scores[0], 1)[:,1].cpu().numpy()
+    else:
+        output_change = torch.sigmoid(scores[0])[:,0].cpu().numpy()
+    output_change = np.rint(output_change).astype(np.uint8)
+    return output_change
+
+def set_color_table(dataset, color_table=None):
+    if color_table is not None:
+        ct = gdal.ColorTable()
+        for i, color in enumerate(color_table):
+            ct.SetColorEntry(i, color)
+
+        _band = dataset.GetRasterBand(1)
+        _band.SetRasterColorInterpretation(gdal.GCI_PaletteIndex)
+        _band.SetColorTable(ct)
+
+def set_no_data_value(dataset, no_data_value=None):
+    if no_data_value is not None:
+        _band = dataset.GetRasterBand(1)
+        _band.SetNoDataValue(no_data_value)
+        
+def build_overviews(dataset, overviewlist=[2,4,8,16,32,64,128]):
+    dataset.BuildOverviews('NEAREST', overviewlist=overviewlist)
+    dataset.FlushCache()
+
+def test_lib_big_memeff(pre_img_path='', post_img_path='', output_path='', logger=None, callback_url=None, job_id=None):
+    # 模型配置
+    # import pdb;pdb.set_trace()
+    if logger is not None:
+        logger.info("Start the first step: building model------")
+    if callback_url is not None:
+        post_progress(callback_url, post_status['running'], 20, None, job_id)
+    kwargs = {
+        'PRE_IMG_PATH': pre_img_path,
+        'POST_IMG_PATH': post_img_path,
+        'TEST_OUT_PATH': output_path,
+        'IMG_SUFFIX': '.tif',
+        'GT_SUFFIX': '.tif',
+        'TEST_CKPT': './best_acc.pth',
+        'MEAN_FILE': './mean_value.txt',
+        'STD_FILE': './std_value.txt',
+        'MODEL_NAME': 'MaskCD',
+        'MODEL_BACKBONE': 'sam_vit_base',
+        'MODEL_NUM_CLASSES': 2,
+        'TEST_BATCHES': 10,
+        'WITH_TTA': False,
+        'with_fft': True,
+        'THRESHOLD': 0.5,
+        'BAND_NUM': 3,
+        'TEST_IMG_SIZE': 512,
+        'TEST_PIXEL_OVERLAP': 32,
+        'PRETRAINED': False,
+    }
+    
+    cfg.set_parse(kwargs)
+    nrank = torch.cuda.device_count()
+    if logger is not None:
+        logger.info("Start the second step: begin predicting------")
+    if callback_url is not None:
+        post_progress(callback_url, post_status['running'], 30, None, job_id)
+    if nrank > 1:
+        mp.set_sharing_strategy('file_system')
+        mp.spawn(test_lib, (torch.cuda.device_count(), cfg), torch.cuda.device_count())
+    else:
+        test_lib(0, torch.cuda.device_count(), cfg) # use cpu when nrank is 0
+    if Path(os.path.join(cfg.TEST_OUT_PATH, 'tmp')).exists():
+        Path(os.path.join(cfg.TEST_OUT_PATH, 'tmp')).rmdir()
+    if logger is not None:
+        logger.info("Start the final step: post processing------")
+    if callback_url is not None:
+        post_progress(callback_url, post_status['running'], 90, None, job_id)
+
+def generate_namelist_from_file(name_list_file, file_root,  suffix):
+    name_list = []
+    with open(name_list_file, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line.endswith(suffix):
+                continue
+            name_list.append(os.path.join(file_root, line))
+    return name_list
+
+def test_lib(local_rank, nrank, cfg):
+    # if nrank > 1:
+    #     os.environ["MASTER_ADDR"] = 'localhost'
+    #     # now = datetime.now()
+    #     # port = 50001+ now.microsecond % 9999
+    #     os.environ["MASTER_PORT"] = str(cfg.PORT)
+    #     torch.distributed.init_process_group(backend='nccl', world_size=nrank, rank=local_rank)
+    #     device = torch.device('cuda', local_rank)
+    # elif nrank == 1:    
+    #     torch.cuda.set_device(local_rank)
+    device = torch.device('cuda', 0)
+    # else:
+    #     device = torch.device('cpu')
+    
+    print('rank {} is ready!'.format(local_rank))
+    # get filename list
+    
+    pre_namelist = [cfg.PRE_IMG_PATH]
+    basenmae = [os.path.split(name)[-1] for name in pre_namelist]
+    post_namelist = [cfg.POST_IMG_PATH]
+    save_shpname = cfg.TEST_OUT_PATH
+    from pathlib import Path
+    cfg.TEST_OUT_PATH = str(Path(cfg.TEST_OUT_PATH).parent)
+    out_namelist = [os.path.join(cfg.TEST_OUT_PATH, name[0:-len(cfg.IMG_SUFFIX)] + cfg.GT_SUFFIX) for name in basenmae]
+    out_shp_namelist = [os.path.join(cfg.TEST_OUT_PATH, 'tmp', name[0:-len(cfg.IMG_SUFFIX)] + '.shp') for name in basenmae]
+    out_shp_namelist1 = [save_shpname]
+    
+    # unused: mean_value file and std_value file
+    mean_file = cfg.MEAN_FILE
+    std_file = cfg.STD_FILE
+    
+    # make output path
+    if local_rank == 0:
+        if not os.path.exists(cfg.TEST_OUT_PATH):
+            os.makedirs(cfg.TEST_OUT_PATH)
+        # if not os.path.exists(os.path.join(cfg.TEST_OUT_PATH, 'shp')):
+        #     os.makedirs(os.path.join(cfg.TEST_OUT_PATH, 'shp'))
+        if not os.path.exists(os.path.join(cfg.TEST_OUT_PATH, 'tmp')):
+            os.makedirs(os.path.join(cfg.TEST_OUT_PATH, 'tmp'))
+            
+    # network
+    net = GenerateNet(cfg)
+    pretrained_dict = torch.load(cfg.TEST_CKPT, map_location='cpu')
+    module_model_state_dict =dict()
+
+    for item, value in pretrained_dict['model_state_dict'].items():
+        if item.startswith('module.'):
+            item = item[7:]
+        module_model_state_dict[item] = value
+    net.load_state_dict(module_model_state_dict, strict=True)
+    net.to(device)
+    if nrank > 1:
+        net = torch.nn.parallel.DistributedDataParallel(net, device_ids=[local_rank], output_device=local_rank)
+    # elif nrank == 1:
+    #     net = torch.nn.DataParallel(net)
+    net.eval()
+    
+    # inference loop
+    for n in range(len(pre_namelist)):
+        print(f"rank {local_rank}: Inference {n+1} of {len(pre_namelist)}: {basenmae[n]}")
+        # get the indexlist that stores the position of small patches in big image
+        if not os.path.exists(post_namelist[n]):
+            print(f'File not exists: {post_namelist[n]}')
+            continue
+        pre_data = gdal.Open(pre_namelist[n])
+        big_img_width = pre_data.RasterXSize
+        big_img_height = pre_data.RasterYSize
+        post_data = gdal.Open(post_namelist[n])
+        big_img_width_post = post_data.RasterXSize
+        big_img_height_post = post_data.RasterYSize
+        gt = list(pre_data.GetGeoTransform())
+        proj = pre_data.GetProjection()
+        gt_post = list(post_data.GetGeoTransform())
+        proj_post = post_data.GetProjection()
+        # 处理pre和post尺寸以及分辨率不一致情况
+        res_gapx = 0 if abs(gt[1] - gt_post[1]) < 0.01 else 1
+        res_gapy = 0 if abs(gt[1] - gt_post[5]) < 0.01 else 1
+        gt_rot_pre = str(gt[2]) + str(gt[4])
+        gt_rot_post = str(gt_post[2]) + str(gt_post[4])
+        gt_str_range_pre = str(gt[0]) + str(gt[3])
+        gt_str_range_post = str(gt_post[0]) + str(gt_post[3])
+        # import ipdb;ipdb.set_trace()
+        tmp_idx = 0
+        if False:
+            
+            tmp_idx = random.randint(0,9999)
+            overlap_info = compute_intersection_info(pre_data, post_data)
+            if overlap_info == None:
+                continue
+            offset1 = overlap_info["offset_img1"]
+            offset2 = overlap_info["offset_img2"]
+            clip_height = overlap_info["size"][0]
+            clip_width = overlap_info["size"][1]
+            pre_data = gdal.Translate(
+                os.path.join(cfg.TEST_OUT_PATH, 'tmp', str(local_rank) + '_' + str(tmp_idx) + '_pre.tif'),
+                pre_data,
+                srcWin=[offset1[1], offset1[0], clip_width, clip_height]  # [col, row, width, height]
+            )
+            post_data = gdal.Translate(
+                os.path.join(cfg.TEST_OUT_PATH, 'tmp', str(local_rank) + '_' + str(tmp_idx) + '_post.tif'),
+                post_data,
+                srcWin=[offset2[1], offset2[0], clip_width, clip_height]  # [col, row, width, height]
+            )
+            pre_namelist[n] = os.path.join(cfg.TEST_OUT_PATH, 'tmp', str(local_rank) + '_' + str(tmp_idx) + '_pre.tif')
+            post_namelist[n] = os.path.join(cfg.TEST_OUT_PATH, 'tmp', str(local_rank) + '_' + str(tmp_idx) + '_post.tif')
+            big_img_width = min(pre_data.RasterXSize, post_data.RasterXSize)
+            big_img_height = min(pre_data.RasterYSize, post_data.RasterYSize)
+            gt_post[0] = overlap_info['bounds'][0]
+            gt_post[3] = overlap_info['bounds'][3]
+        else:
+            print("重采样前后时相影像")
+            tmp_idx = random.randint(0,9999)
+
+            extent1 = get_extent(pre_data)
+            extent2 = get_extent(post_data)
+
+            srs1 = get_srs(pre_data)
+            srs2 = get_srs(post_data)
+
+            poly1 = get_polygon_from_extent(extent1)
+            poly2 = get_polygon_from_extent(extent2)
+
+            # 将 poly2 转换为 poly1 所在的投影
+            poly1_in_srs2 = transform_polygon(poly1, srs1, srs2)
+            if poly1_in_srs2 is None:
+                raise RuntimeError("无法将第一张图的范围投影到第二张图的坐标系")
+
+            intersection = poly2.intersection(poly1_in_srs2)
+            if intersection.is_empty:
+                print("两图无相交区域")
+                continue
+
+            xmin, ymin, xmax, ymax = intersection.bounds
+
+            pre_data = gdal.Warp(
+                    os.path.join(cfg.TEST_OUT_PATH, 'tmp', str(tmp_idx) + '_pre.tif'),
+                    pre_data,
+                    options=gdal.WarpOptions(
+                        format='GTiff',
+                        creationOptions=["TILED=YES","COMPRESS=LZW","BIGTIFF=YES","PROFILE=GEOTIFF"],
+                        dstSRS=proj_post, 
+                        xRes=gt_post[1],
+                        yRes=gt_post[5],
+                        outputBounds = intersection.bounds,
+                        resampleAlg = "Near",#"NearestNeighbour",#gdal.GRIORA_Bilinear,
+                        multithread = True,
+                        warpOptions = ['NUM_THREADS=ALL_CPUS'],
+                        dstNodata = 0))
+            
+            post_data = gdal.Warp(
+                    os.path.join(cfg.TEST_OUT_PATH, 'tmp', str(tmp_idx) + '_post.tif'),
+                    post_data,
+                    options=gdal.WarpOptions(
+                        format='GTiff',
+                        creationOptions=["TILED=YES","COMPRESS=LZW","BIGTIFF=YES","PROFILE=GEOTIFF"],
+                        dstSRS=proj_post, 
+                        xRes=gt_post[1],
+                        yRes=gt_post[5],
+                        outputBounds = intersection.bounds,
+                        resampleAlg = "Near",#"NearestNeighbour",#gdal.GRIORA_Bilinear,
+                        multithread = True,
+                        warpOptions = ['NUM_THREADS=ALL_CPUS'],
+                        dstNodata = 0))
+            
+            gt_post = post_data.GetGeoTransform()
+            big_img_width = pre_data.RasterXSize
+            big_img_height = pre_data.RasterYSize
+            pre_namelist[n] = os.path.join(cfg.TEST_OUT_PATH, 'tmp', str(local_rank) + '_' + str(tmp_idx) + '_pre.tif')
+            post_namelist[n] = os.path.join(cfg.TEST_OUT_PATH, 'tmp', str(local_rank) + '_' + str(tmp_idx) + '_post.tif')
+        del pre_data
+        del post_data
+        index_list, nx, ny = generate_indexlist(big_img_width, big_img_height, ori_w=0, ori_h=0, \
+            subsize=(cfg.TEST_IMG_SIZE,cfg.TEST_IMG_SIZE), overlap=(cfg.TEST_PIXEL_OVERLAP, cfg.TEST_PIXEL_OVERLAP))
+        # pack path parameters
+        path_info = {
+            "preImgPath": pre_namelist[n],
+            "postImgPath": post_namelist[n],
+            "index_list": index_list,
+            "clipsize": (cfg.TEST_IMG_SIZE, cfg.TEST_IMG_SIZE),
+            "overlap": (cfg.TEST_PIXEL_OVERLAP, cfg.TEST_PIXEL_OVERLAP),
+            "mean_file": mean_file,
+            "std_file": std_file
+        }
+    
+        #test_dataloader
+        test_data = OnlineDataset(path_info, cfg.BAND_NUM, cfg.with_fft)
+        data_loader_test = torch.utils.data.DataLoader(test_data, cfg.TEST_BATCHES, shuffle=False, num_workers=0, pin_memory=False, persistent_workers=False) 
+        # create result file
+        
+        driver = gdal.GetDriverByName('GTiff')
+        out_data = driver.Create(out_namelist[n], big_img_width, big_img_height, 1, gdal.GDT_Byte, options=['COMPRESS=LZW'])
+        out_data.SetProjection(proj_post)
+        out_data.SetGeoTransform(gt_post)
+        set_color_table(out_data, [(0,0,0), (255,255,255)])
+        set_no_data_value(out_data, 0)
+        # start prediction
+        if local_rank ==0:
+            pbar = tqdm(desc=basenmae[n], total=len(data_loader_test))
+            
+        # cur_batch = 0
+        # pre_img, post_img, nodata_mask, indexs = None, None, None, None
+        for idx, (pre_img, post_img, nodata_mask, indexs) in enumerate(data_loader_test):
+            # 跳过无效数据
+            non_zero_mask = nodata_mask.view(nodata_mask.size(0), -1).abs().sum(dim=1) != 0
+            if non_zero_mask.sum() == 0:
+                if local_rank == 0:
+                    pbar.update()
+                continue
+            pre_img = pre_img[non_zero_mask]
+            post_img = post_img[non_zero_mask]
+            # 手动batch
+            # cur_batch += 1
+            # if cur_batch == 1:
+            #     pre_img, post_img, nodata_mask, indexs = _pre_img, _post_img, _nodata_mask, _indexs
+            # if cur_batch != cfg.TEST_BATCHES:
+            #     if cur_batch == 1:
+            #         if local_rank == 0:
+            #             pbar.update()
+            #         continue
+            #     else:
+            #         pre_img = torch.concat((pre_img, _pre_img), 0)
+            #         post_img = torch.concat((post_img, _post_img), 0)
+            #         nodata_mask = torch.concat((nodata_mask, _nodata_mask), 0)
+            #         indexs = indexs + _indexs
+            #     if idx == len(data_loader_test) - 1:
+            #         pass
+            #     else:
+            #         if local_rank == 0:
+            #             pbar.update()
+            #         continue
+            # else:
+            #     pre_img = torch.concat((pre_img, _pre_img), 0)
+            #     post_img = torch.concat((post_img, _post_img), 0)
+            #     nodata_mask = torch.concat((nodata_mask, _nodata_mask), 0)
+            #     indexs = indexs + _indexs
+            # cur_batch = 0
+            
+            img = np.concatenate((pre_img, post_img), 1)
+            if cfg.WITH_TTA:
+                img90 = np.array(np.rot90(img, axes = (2, 3)))                 #rotate 90
+                img1 = np.ascontiguousarray(np.concatenate([img, img90]), dtype = np.float32)  #concat raw and rot90
+                img2 = np.ascontiguousarray(np.array(img1)[:,:,::-1], dtype = np.float32)
+                img3 = np.ascontiguousarray(np.array(img1)[:,:,:,::-1], dtype = np.float32)
+                img4 = np.ascontiguousarray(np.array(img2)[:,:,:,::-1], dtype = np.float32)
+                images = np.ascontiguousarray(np.concatenate([img1, img2, img3, img4]), dtype = np.float32)
+                output = test_with_TTA(net, images, cfg.MODEL_NUM_CLASSES, device)
+            else:
+                output = test_normal(net, img, cfg.MODEL_NUM_CLASSES, device) # (b,h,w)
+            for i in range(output.shape[0]):
+                # maskout nodata area
+                pred = output[i] * nodata_mask[i].numpy().astype(output[i].dtype)
+                clip_x, clip_y, pad_x, pad_y = indexs[0][i], indexs[1][i], indexs[2][i], indexs[3][i]
+                overlap_half = cfg.TEST_PIXEL_OVERLAP // 2
+                if pad_x == -1:
+                    pred = pred[:,overlap_half:]
+                elif pad_x == 0 and overlap_half > 0:
+                    pred = pred[:,overlap_half:-overlap_half]
+                elif pad_x == 0 and overlap_half == 0:
+                    pass
+                else:
+                    pred = pred[:,overlap_half:-int(pad_x)]
+                
+                if pad_y == -1:
+                    pred = pred[overlap_half:,:]
+                elif pad_y == 0 and overlap_half > 0:
+                    pred = pred[overlap_half:-overlap_half,:]
+                elif pad_y == 0 and overlap_half == 0:
+                    pass
+                else:
+                    pred = pred[overlap_half:-int(pad_y),:]
+                _band = out_data.GetRasterBand(1)
+                _band.WriteArray(pred, int(clip_x.data), int(clip_y.data))
+                _band.FlushCache()
+            if local_rank == 0:
+                pbar.update()
+        build_overviews(out_data)
+        del test_data.predataset
+        del test_data.postdataset
+        # raster to shapefile
+        driver = ogr.GetDriverByName('ESRI Shapefile')
+        
+        shape_dataset = driver.CreateDataSource(out_shp_namelist[n])
+        if shape_dataset is None:
+            print('[FATAL] OGR create file failed. [%s]'%out_shp_namelist[n])
+            del out_data
+            continue
+        proj_ref = out_data.GetProjectionRef()
+        proj_shp = osr.SpatialReference()
+        proj_shp.ImportFromWkt(proj_ref)
+        # layer = shape_dataset.CreateLayer('mask', proj_shp, ogr.wkbPolygon)
+        layer = shape_dataset.CreateLayer(str(Path(out_shp_namelist[0]).stem), proj_shp, ogr.wkbPolygon)
+        # field_name = ogr.FieldDefn('shape', ogr.OFTInteger)
+        # layer.CreateField(field_name)
+
+        pre_code_field = ogr.FieldDefn("pre_code", ogr.OFTString)
+        pre_year_field = ogr.FieldDefn('pre_year', ogr.OFTInteger)
+        post_code_field = ogr.FieldDefn("curr_code", ogr.OFTString)
+        post_year_field = ogr.FieldDefn("curr_year", ogr.OFTInteger)
+        layer.CreateField(pre_code_field)
+        layer.CreateField(pre_year_field)
+        layer.CreateField(post_code_field)
+        layer.CreateField(post_year_field)
+
+        band = out_data.GetRasterBand(1)
+        gdal.Polygonize(band, band, layer, 0, [], callback=None)
+        src_srs = layer.GetSpatialRef()
+        tgt_srs = osr.SpatialReference()  # 获取目标的坐标系或投影， web mercator
+        tgt_srs.ImportFromEPSG(3857)
+        transform = osr.CoordinateTransformation(src_srs, tgt_srs)
+
+        for feature in layer:
+            feature.SetField("pre_code", "0")
+            try:
+                pre_year_value = str(Path(cfg.PRE_IMG_PATH).name).split('_')[1]
+                pre_year_value = int(pre_year_value)
+            except:
+                pre_year_value = 0
+            # feature.SetField("pre_year", pre_year_value)
+            
+            feature.SetField("curr_code", "0")
+            try:
+                curr_year_value = str(Path(cfg.POST_IMG_PATH).name).split('_')[1]
+                curr_year_value = int(curr_year_value)
+            except:
+                curr_year_value = 0
+            feature.SetField("curr_year", curr_year_value)
+            feature.SetField("pre_year", int(curr_year_value) - 1)
+            layer.SetFeature(feature)
+
+        del shape_dataset
+        del out_data
+        if tmp_idx >= 0:
+            os.remove(os.path.join(cfg.TEST_OUT_PATH, 'tmp', str(local_rank) + '_' + str(tmp_idx) + '_pre.tif'))
+            os.remove(os.path.join(cfg.TEST_OUT_PATH, 'tmp', str(local_rank) + '_' + str(tmp_idx) + '_post.tif'))
+        # import ipdb;ipdb.set_trace()
+        fill_hole_shp = str(Path(out_shp_namelist[0]).parent / (Path(out_shp_namelist[0]).stem + '_fillhole.shp'))
+        fill_hole(out_shp_namelist[0], fill_hole_shp)
+        # fill_hole(out_shp_namelist[0], out_shp_namelist1[0])
+        output_shp = out_shp_namelist1[0]
+        # simplify_preserve_toplogy(fill_hole_shp, output_shp, tolerance=1e-5)
+        smooth_polygons_gdf_used(fill_hole_shp, output_shp)
+
+        os.remove(out_namelist[n])
+    if local_rank == 0 and Path(os.path.join(cfg.TEST_OUT_PATH, 'tmp')).exists():
+        shutil.rmtree(os.path.join(cfg.TEST_OUT_PATH, 'tmp'), ignore_errors=True)
+
+        # os.rmdir(os.path.join(cfg.TEST_OUT_PATH, 'tmp'))
+
+def _worker(pre, post, out, logger, callback_url, job_id):
+    # return test_lib_big_memeff(pre, post, out, logger)
+    return test_lib_big_memeff(pre, post, out, logger, callback_url, job_id)
+
+def run_parallel(pre_list, post_list, out_path, workers=1, logger=None, callback_url=None, job_id=None):
+    # import pdb;pdb.set_trace()
+    assert len(pre_list) == len(post_list)
+    logger = [logger] * len(pre_list)
+    callback_url = [callback_url] * len(pre_list)
+    job_id = [job_id] * len(pre_list)
+    tasks = list(zip(pre_list, post_list, [out_path]*len(pre_list), logger, callback_url, job_id))
+    ctx = get_context("spawn")
+    with ctx.Pool(processes=workers) as pool:
+        for ret in pool.starmap(_worker, tasks, chunksize=1):
+            if ret != None:
+                if ret[0] == "err":
+                    print("[ERR]", ret[1], ret[2])
+
+if __name__ == "__main__":
+    pre_img_path = '/nfs/project/netdisk/192.168.100.189/d/shengtaicopy/演示/1/pre.tif'
+    post_img_path = '/nfs/project/netdisk/192.168.100.189/d/shengtaicopy/演示/1/post.tif'
+    output_path = '/nfs/project/netdisk/192.168.100.189/d/shengtaicopy/演示/1/cp_pred4/'
+    test_lib_big_memeff(pre_img_path, post_img_path, output_path)

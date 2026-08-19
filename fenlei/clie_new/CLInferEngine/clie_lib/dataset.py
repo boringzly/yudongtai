@@ -1,0 +1,202 @@
+import os
+import numpy as np
+import time
+from tqdm import tqdm
+import torch
+from torch.utils import data
+from torchvision import transforms as T
+from .imageio import ImageReader
+import cv2
+
+
+def clahe_process(img, band):
+    print('excute clahe process')
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    if band == 3:
+        b, g, r = cv2.split(img)
+        b = clahe.apply(b)
+        g = clahe.apply(g)
+        r = clahe.apply(r)
+        new_img = cv2.merge([b, g, r])
+        return new_img
+    elif band == 4:
+        b, g, r, nir = cv2.split(img)
+        b = clahe.apply(b)
+        g = clahe.apply(g)
+        r = clahe.apply(r)
+        nir = clahe.apply(nir)
+        new_img = cv2.merge([b, g, r, nir])
+        return new_img
+    else:
+        return img
+
+
+class InferDataMgr(data.Dataset):
+
+    def __init__(self, filename, band_list, width, height, pixel_overlap, mean_value, std_value, retry=0,
+                 with_clahe=False, upsample=False, dynamic_mean=False):
+        super(InferDataMgr, self).__init__()
+        try:
+            self.image_reader = ImageReader(filename)
+        except Exception:
+            self.image_reader = None
+            return
+        self.mask_reader = None
+        try:
+            base_name, ext = os.path.splitext(filename)
+            file_name = os.path.basename(base_name)
+            maskname = f"./tmp/mask/{file_name}_mask{ext}"
+            self.mask_reader = ImageReader(maskname)
+        except Exception:
+            pass
+        self.image_reader.set_band_list(band_list)
+        self.width = width
+        self.height = height
+        self.upsample = upsample
+        self.dynamic_mean = dynamic_mean
+        img_width = self.image_reader.width
+        img_height = self.image_reader.height
+
+        self.filename = filename
+        self.band_list = band_list
+        self.retry = retry
+
+        normalize = T.Normalize(mean=mean_value, std=std_value)
+        self.transforms = T.Compose([
+            T.ToTensor(),
+            normalize
+        ])
+        self.with_clahe = with_clahe
+
+        pixel_overlap_half = pixel_overlap // 2
+
+        width_crop = width - pixel_overlap
+        width_crop_num = (img_width - width_crop) // width_crop + 1
+        width_temp = width_crop_num * width_crop
+        width_pad_down = pixel_overlap_half
+        width_pad_up = width_temp + width_crop - img_width + pixel_overlap_half if width_temp != img_width else pixel_overlap_half
+
+        height_crop = height - pixel_overlap
+        height_crop_num = (img_height - height_crop) // height_crop + 1
+        height_temp = height_crop_num * height_crop
+        height_pad_down = pixel_overlap_half
+        height_pad_up = height_temp + height_crop - img_height + pixel_overlap_half if height_temp != img_height else pixel_overlap_half
+
+        self.width_crop = width_crop
+        self.width_pad_down = width_pad_down
+        self.width_pad_up = width_pad_up
+        self.height_crop = height_crop
+        self.height_pad_down = height_pad_down
+        self.height_pad_up = height_pad_up
+
+        self.index_list = []
+        for i in range(height_crop_num + 1):
+            for j in range(width_crop_num + 1):
+                if (i == height_crop_num and height_pad_up == pixel_overlap_half) or (
+                        j == width_crop_num and width_pad_up == pixel_overlap_half):
+                    continue
+                self.index_list.append((i, j))
+
+    def __getitem__(self, index):
+        idx_i, idx_j = self.index_list[index]
+        height_down = idx_i * self.height_crop - self.height_pad_down
+        height_up = idx_i * self.height_crop - self.height_pad_down + self.height
+        width_down = idx_j * self.width_crop - self.width_pad_down
+        width_up = idx_j * self.width_crop - self.width_pad_down + self.width
+
+        _height_down, _width_down = height_down, width_down
+        if height_down < 0:
+            _height_down = 0
+        if width_down < 0:
+            _width_down = 0
+        if height_up > self.image_reader.height:
+            _height_down = self.image_reader.height - self.height
+        if width_up > self.image_reader.width:
+            _width_down = self.image_reader.width - self.width
+
+        status = 'bad'
+        _retry = 0
+        while status == 'bad':
+            try:
+                _img = self.image_reader.read_image(read_range=(_width_down, _height_down, self.width, self.height))
+                if self.mask_reader is not None:
+                    _mask = self.mask_reader.read_image(read_range=(_width_down, _height_down, self.width, self.height))
+                else:
+                    _mask = np.ones_like(_img)
+                if self.with_clahe:
+                    _img = clahe_process(_img, len(self.band_list))
+                img = _img.copy()
+                mask = _mask.copy()
+
+                if height_down < 0:
+                    img[0:self.height_pad_down, :, :] = _img[0:self.height_pad_down, :, :][::-1, :, :]
+                    img[self.height_pad_down:self.height, :, :] = _img[0:(self.height - self.height_pad_down), :, :]
+                    _img = img.copy()
+                if width_down < 0:
+                    img[:, 0:self.width_pad_down, :] = _img[:, 0:self.width_pad_down, :][:, ::-1, :]
+                    img[:, self.width_pad_down:self.width, :] = _img[:, 0:(self.width - self.width_pad_down), :]
+                    _img = img.copy()
+                if height_up > self.image_reader.height:
+                    _height_offset = height_up - self.image_reader.height
+                    img[(self.height - _height_offset):self.height, :, :] = _img[(self.height - _height_offset):self.height, :, :][::-1, :, :]
+                    img[0:(self.height - _height_offset), :, :] = _img[_height_offset:self.height, :, :]
+                    _img = img.copy()
+                if width_up > self.image_reader.width:
+                    _width_offset = width_up - self.image_reader.width
+                    img[:, (self.width - _width_offset):self.width, :] = _img[:, (self.width - _width_offset):self.width, :][:, ::-1, :]
+                    img[:, 0:(self.width - _width_offset), :] = _img[:, _width_offset:self.width, :]
+                    _img = img.copy()
+                del _img
+
+                img_mask = np.sum(mask, axis=2)
+                img_mask[img_mask > 0] = 1
+                #import ipdb ; ipdb.set_trace()
+                #print(self.upsample)
+                if self.upsample:
+                    img = cv2.resize(img, dsize=None, fx=2, fy=2, interpolation=cv2.INTER_LINEAR)
+                img_mask = torch.from_numpy(img_mask.astype(np.uint8))
+                
+                if img.dtype == np.uint16:
+                    img = img.astype(np.float16)
+                #if img.dtype == np.float16:
+                #    img = img.astype(np.uint8)
+
+                if self.dynamic_mean:
+                    mask_img = img.sum(2) != 0
+                    valid_img = img[mask_img]
+                    mean = valid_img.mean(0)/255.0
+                    var = np.sqrt(valid_img.var(0))/255.0
+                    normalize = T.Normalize(mean=mean, std=var)
+                    transforms = T.Compose([T.ToTensor(), normalize])
+                    img = transforms(np.ascontiguousarray(img))
+                else:
+                    img = self.transforms(img)
+                status = 'good'
+            except:
+                _retry += 1
+                if _retry > self.retry:
+                    img = np.zeros((self.height, self.width, len(self.band_list)), dtype=np.uint8)
+                    img_mask = np.sum(img, axis=2)
+                    img_mask[img_mask > 0] = 1
+                    if self.upsample:
+                        img = cv2.resize(img, dsize=None, fx=2, fy=2, interpolation=cv2.INTER_LINEAR)
+                    img_mask = torch.from_numpy(img_mask.astype(np.uint8))
+                    if self.dynamic_mean:
+                        mask_img = img.sum(2) != 0
+                        valid_img = img[mask_img]
+                        mean = valid_img.mean(0)/255.0
+                        var = np.sqrt(valid_img.var(0))/255.0
+                        normalize = T.Normalize(mean=mean, std=var)
+                        transforms = T.Compose([T.ToTensor(), normalize])
+                        img = transforms(np.ascontiguousarray(img))
+                    else:
+                        img = self.transforms(img)
+                    break
+                tqdm.write('[WARNING] ' + time.strftime('[%y%m%d_%H:%M:%S]') + \
+                           ' Retry ' + str(_retry) + ' times for reading ' + str(
+                    self.index_list[index]) + ' in ' + self.filename)
+
+        return img, img_mask, str(idx_i), str(idx_j), status
+
+    def __len__(self):
+        return len(self.index_list)

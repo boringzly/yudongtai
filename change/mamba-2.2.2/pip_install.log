@@ -1,0 +1,14 @@
+nohup: ignoring input
+Processing /siwei3/app_cpu_py39_add_intersection_5b67d167aa3b4431809ea9014f05c51d/10/app_cpu_py39_add_intersection/mamba-2.2.2
+  Preparing metadata (setup.py): started
+  Preparing metadata (setup.py): finished with status 'done'
+Building wheels for collected packages: mamba_ssm
+  Building wheel for mamba_ssm (setup.py): started
+  Building wheel for mamba_ssm (setup.py): still running...
+  Building wheel for mamba_ssm (setup.py): finished with status 'done'
+  Created wheel for mamba_ssm: filename=mamba_ssm-2.2.2-cp39-cp39-linux_x86_64.whl size=343413609 sha256=7a115e8444e82af16b0ee6bd969fa2ed46e435d76b32f99ad07f44a1538e00aa
+  Stored in directory: /root/.cache/pip/wheels/ba/dd/41/5393c3da89eacb8a654f9672055e0b4622628a11db188224ee
+Successfully built mamba_ssm
+Installing collected packages: mamba_ssm
+Successfully installed mamba_ssm-2.2.2
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv

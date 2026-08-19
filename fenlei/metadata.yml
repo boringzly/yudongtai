@@ -1,0 +1,72 @@
+id: "change_classification"
+version: "1.0"
+name: "变化检测类别识别"
+conda_env: "clbase_1"
+entry: "main.py"
+author: "cd_seg"
+email: ""
+
+parameters:
+  - id: "pre_image"
+    name: "前时相影像路径"
+    type: "str"
+    required: true
+    default: null
+    position: "input"
+
+  - id: "post_image"
+    name: "后时相影像路径"
+    type: "str"
+    required: true
+    default: null
+    position: "input"
+
+  - id: "mask_shp"
+    name: "变化检测结果SHP路径"
+    type: "str"
+    required: true
+    default: null
+    position: "input"
+
+  - id: "model_path"
+    name: "分类模型路径"
+    type: "str"
+    required: false
+    default: "./clie_new/tools/fullclass_chinaall_3b.pth"
+    position: "input"
+
+  - id: "dst_path"
+    name: "输出目录路径"
+    type: "str"
+    required: true
+    default: null
+    position: "output"
+    runtime_input: true
+
+  - id: "output_dataset"
+    name: "输出数据集目录"
+    type: "str"
+    required: false
+    default: null
+    position: "archieve"
+
+  - id: "kafka_server_ip_port"
+    name: "kafka服务器IP和端口"
+    type: "str"
+    required: false
+    default: null
+    position: "running"
+
+  - id: "kafka_topic"
+    name: "kafka消息主题"
+    type: "str"
+    required: false
+    default: null
+    position: "running"
+
+  - id: "kafka_task_id"
+    name: "kafka任务ID"
+    type: "str"
+    required: false
+    default: null
+    position: "running"

@@ -1,0 +1,1 @@
+from .generatenet import GenerateNet

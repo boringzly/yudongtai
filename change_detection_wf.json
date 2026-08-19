@@ -1,0 +1,123 @@
+{
+    "name": "变化检测与类别识别",
+    "version": "1.0",
+    "id": "change_detection_classification",
+    "author": "cd_seg",
+    "email": "",
+    "config": {
+        "fast_run": false
+    },
+    "execution_order": [
+        "change_detection",
+        "change_classification"
+    ],
+    "input": {
+        "parameters": {
+            "pre_image": {
+                "name": "前时相影像路径",
+                "type": "str"
+            },
+            "post_image": {
+                "name": "后时相影像路径",
+                "type": "str"
+            }
+        }
+    },
+    "output": {
+        "parameters": [
+            "path_output",
+            "path_working"
+        ],
+        "final": [
+            "change_classification"
+        ],
+        "render": [
+            "change_detection",
+            "change_classification"
+        ]
+    },
+    "common": {
+        "running": {
+            "parameters": [
+                "kafka_server_ip_port",
+                "kafka_topic",
+                "kafka_task_id"
+            ]
+        },
+        "achieve": {
+            "parameters": [
+                "output_dataset"
+            ]
+        }
+    },
+    "steps": {
+        "change_detection": {
+            "id": "change_detection",
+            "name": "变化检测",
+            "entry": "main.py",
+            "conda_env": "clbase_1",
+            "process": "single",
+            "high_resource": true,
+            "parameters": {
+                "input": {
+                    "pre_image": {
+                        "from_step": "@entry",
+                        "from_name": "pre_image"
+                    },
+                    "post_image": {
+                        "from_step": "@entry",
+                        "from_name": "post_image"
+                    }
+                },
+                "output": {
+                    "dst_path": {
+                        "place": "path_working",
+                        "value": "@root"
+                    },
+                    "change_shp": {
+                        "place": "@swap",
+                        "value": "output_shp"
+                    }
+                }
+            }
+        },
+        "change_classification": {
+            "id": "change_classification",
+            "name": "变化检测类别识别",
+            "entry": "main.py",
+            "conda_env": "clbase_1",
+            "process": "single",
+            "high_resource": true,
+            "parameters": {
+                "input": {
+                    "pre_image": {
+                        "from_step": "@entry",
+                        "from_name": "pre_image"
+                    },
+                    "post_image": {
+                        "from_step": "@entry",
+                        "from_name": "post_image"
+                    },
+                    "mask_shp": {
+                        "from_step": "change_detection",
+                        "from_name": "change_shp"
+                    }
+                },
+                "output": {
+                    "dst_path": {
+                        "place": "path_output",
+                        "value": "out"
+                    },
+                    "path_working": {
+                        "place": "path_working",
+                        "value": "@root"
+                    },
+                    "classified_shp": {
+                        "place": "@swap",
+                        "value": "output_shp"
+                    }
+                }
+            }
+        }
+    }
+}
