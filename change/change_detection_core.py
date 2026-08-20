@@ -10,6 +10,24 @@ except:
     ProgressMessageSender = None
 prg_sender = None
 
+
+class NonFatalTaskWarning(RuntimeError):
+    """记录告警但不让当前工作流步骤以失败状态退出。"""
+
+
+def _is_nonfatal_warning(exc):
+    if isinstance(exc, NonFatalTaskWarning):
+        return True
+    message = str(exc).lower()
+    warning_markers = (
+        'maximum tiff file size exceeded',
+        'tiffappendtostrip',
+        'bigtiff',
+        '未生成结果文件',
+    )
+    return any(marker in message for marker in warning_markers)
+
+
 class ProgressMessageSenderWrap():
     
     def __init__(self, bootstrap_servers='', topic='', taskId=None):
@@ -41,9 +59,14 @@ class ProgressMessageSenderWrap():
     #         return self.prg_sender.calc_progress_value(index, total, min_value, max_value)
     def send(self, message_dict):
         if self.prg_sender is not None:
-            self.prg_sender.send(message_dict)
+            return self.prg_sender.send(message_dict)
         else:
-            print(f'[SIMULATED SEND] {message_dict}')  # 模拟发送
+            print(f'[SIMULATED SEND] {message_dict}', flush=True)  # 模拟发送
+            return False
+
+    def close(self):
+        if self.prg_sender is not None and hasattr(self.prg_sender, 'close'):
+            self.prg_sender.close()
 
     def calc_progress_value(self, index, total, min_value=0, max_value=100):
         if self.prg_sender is not None:
@@ -54,7 +77,10 @@ class ProgressMessageSenderWrap():
 
 def init_progress_message_sender(kafka_server_ip_port, kafka_topic, kafka_task_id):
     global prg_sender
-    prg_sender = ProgressMessageSenderWrap(kafka_server_ip_port, kafka_topic, kafka_task_id)
+    bootstrap_servers = kafka_server_ip_port or os.environ.get('KAFKA_SERVER_IP_PORT', '')
+    topic = kafka_topic or os.environ.get('KAFKA_TOPIC', '')
+    task_id = kafka_task_id or os.environ.get('KAFKA_TASK_ID')
+    prg_sender = ProgressMessageSenderWrap(bootstrap_servers, topic, task_id)
 
 def init_progress_message_title(step_id, step_name):
     title = None
@@ -91,6 +117,26 @@ def init_progress_message_source(rank=None):
 def swap_write(key, value):
     print(f"##SWAP:{key}={json.dumps(value, ensure_ascii=False)}")
 
+
+_SHAPEFILE_SIDECARS = (
+    '.shp', '.shx', '.dbf', '.prj', '.cpg', '.qix', '.sbn', '.sbx', '.fix', '.shp.xml'
+)
+
+
+def _remove_shapefile_dataset(shp_path):
+    """删除一个确定路径的 Shapefile 全套文件，避免复用上次运行的旧结果。"""
+    stem = os.path.splitext(str(shp_path))[0]
+    for extension in _SHAPEFILE_SIDECARS:
+        candidate = stem + extension
+        if os.path.isfile(candidate):
+            os.remove(candidate)
+
+
+def _remove_file_if_exists(path):
+    if os.path.isfile(path):
+        os.remove(path)
+
+
 # ========== DatasetBuilder ==========
 
 from DatasetBuilder import DatasetBuilder
@@ -105,11 +151,9 @@ def change_detection(pre_image, post_image, model_path, dst_path, output_dataset
 
     # 2. 检查输入
     if not os.path.exists(pre_image):
-        prg_sender.send({'progress': 100, 'runningStatus': 'completed', 'runningInfo': f'前时相影像不存在: {pre_image}'})
-        return
+        raise FileNotFoundError(f'前时相影像不存在: {pre_image}')
     if not os.path.exists(post_image):
-        prg_sender.send({'progress': 100, 'runningStatus': 'completed', 'runningInfo': f'后时相影像不存在: {post_image}'})
-        return
+        raise FileNotFoundError(f'后时相影像不存在: {post_image}')
 
     # 3. 创建输出目录
     os.makedirs(dst_path, exist_ok=True)
@@ -119,6 +163,7 @@ def change_detection(pre_image, post_image, model_path, dst_path, output_dataset
     pre_stem = Path(pre_image).stem
     post_stem = Path(post_image).stem
     output_shp = os.path.join(dst_path, f'{pre_stem}_{post_stem}_change.shp')
+    _remove_shapefile_dataset(output_shp)
 
     # 5. 调用核心变化检测推理
     prg_sender.send({'progress': 10, 'runningStatus': 'running', 'runningInfo': '加载模型并执行变化检测推理'})
@@ -151,10 +196,10 @@ def change_detection(pre_image, post_image, model_path, dst_path, output_dataset
         progress_callback=_cd_progress
     )
 
-    # 6. 检查结果是否生成（无变化时不创建文件）
+    # 6. 检查结果是否生成。缺少产物记为告警，由入口返回 completed，避免中断工作流。
     if not os.path.exists(output_shp):
-        prg_sender.send({'progress': 100, 'runningStatus': 'completed', 'runningInfo': '未检测到变化区域'})
-        return
+        swap_write('output_shp', output_shp)
+        raise NonFatalTaskWarning(f'变化检测未生成结果文件: {output_shp}')
 
     # 7. 输出 Swap 变量（输出文件路径供下游使用）
     swap_write('output_shp', output_shp)
@@ -190,18 +235,15 @@ def change_detection_folder(pre_folder, post_folder, model_path, dst_path, outpu
 
     # 2. 检查输入
     if not pre_folder.exists():
-        prg_sender.send({'progress': 100, 'runningStatus': 'completed', 'runningInfo': f'前时相文件夹不存在: {pre_folder}'})
-        return
+        raise FileNotFoundError(f'前时相文件夹不存在: {pre_folder}')
     if not post_folder.exists():
-        prg_sender.send({'progress': 100, 'runningStatus': 'completed', 'runningInfo': f'后时相文件夹不存在: {post_folder}'})
-        return
+        raise FileNotFoundError(f'后时相文件夹不存在: {post_folder}')
 
     # 3. 获取前时相文件夹中所有影像文件
     pre_files = sorted(list(pre_folder.glob("*.tif")) + list(pre_folder.glob("*.tiff")))
 
     if not pre_files:
-        prg_sender.send({'progress': 100, 'runningStatus': 'completed', 'runningInfo': f'前时相文件夹中无影像文件: {pre_folder}'})
-        return
+        raise RuntimeError(f'前时相文件夹中无影像文件: {pre_folder}')
 
     # 4. 匹配前后时相文件对
     valid_pairs = []
@@ -216,8 +258,7 @@ def change_detection_folder(pre_folder, post_folder, model_path, dst_path, outpu
 
     total = len(valid_pairs)
     if total == 0:
-        prg_sender.send({'progress': 100, 'runningStatus': 'completed', 'runningInfo': '未找到任何匹配的前后时相影像对'})
-        return
+        raise RuntimeError('未找到任何匹配的前后时相影像对')
 
     swap_write('total_pairs', total)
     if skipped_unmatched:
@@ -268,6 +309,11 @@ def change_detection_folder(pre_folder, post_folder, model_path, dst_path, outpu
             return _cb
 
         try:
+            tif_src = os.path.join(shp_dir, f'{stem}.tif')
+            tif_dst = os.path.join(tif_dir, f'{stem}.tif')
+            _remove_shapefile_dataset(output_shp)
+            _remove_file_if_exists(tif_src)
+            _remove_file_if_exists(tif_dst)
             test_lib_big_memeff(
                 pre_img_path=str(pre_path),
                 post_img_path=str(post_path),
@@ -281,14 +327,13 @@ def change_detection_folder(pre_folder, post_folder, model_path, dst_path, outpu
             if os.path.exists(output_shp):
                 output_shp_list.append(output_shp)
             else:
-                logger.info(f'处理 {stem} 未检测到变化区域')
+                raise NonFatalTaskWarning(f'变化检测未生成结果文件: {output_shp}')
             # 将推理产生的 tif 中间结果移动到 tif 目录
-            tif_src = os.path.join(shp_dir, f'{stem}.tif')
             if os.path.exists(tif_src):
                 import shutil as _shutil
-                _shutil.move(tif_src, os.path.join(tif_dir, f'{stem}.tif'))
+                _shutil.move(tif_src, tif_dst)
         except Exception as e:
-            logger.error(f'处理 {stem} 失败: {e}', exc_info=True)
+            logger.warning(f'处理 {stem} 出现告警，已跳过: {e}')
             failed_list.append({'file': stem, 'error': str(e)})
 
     # 7. 不合并结果，保留单个 SHP 文件供后续分类使用
@@ -300,7 +345,11 @@ def change_detection_folder(pre_folder, post_folder, model_path, dst_path, outpu
     swap_write('output_tif', tif_dir)
     swap_write('processed_count', len(output_shp_list))
     if failed_list:
-        swap_write('failed_list', failed_list)
+        swap_write('warning_list', failed_list)
+
+    # 部分失败继续运行；如果一项有效结果都没有，说明是系统性失败，不能伪装成 completed。
+    if not output_shp_list:
+        raise RuntimeError(f'批量变化检测全部失败，0/{total} 对影像生成结果')
 
     # 9. 输出 Dataset
     prg_sender.send({'progress': 99, 'runningStatus': 'running', 'runningInfo': '创建输出数据集'})
@@ -312,10 +361,10 @@ def change_detection_folder(pre_folder, post_folder, model_path, dst_path, outpu
         ds.set_render(["result"])
         ds.save()
 
-    # 10. 报告完成
+    # 10. 单个影像失败按告警处理，不中断整个批量工作流。
     result_msg = f'批量变化检测完成，成功处理 {len(output_shp_list)}/{total} 对影像'
     if failed_list:
-        result_msg += f'，{len(failed_list)} 对失败'
+        result_msg += f'，{len(failed_list)} 对出现告警并已跳过'
     prg_sender.send({'progress': 100, 'runningStatus': 'completed', 'runningInfo': result_msg})
 
 
@@ -326,9 +375,33 @@ def entry(pre_image, post_image, model_path, dst_path, output_dataset, step_id, 
     init_progress_message_sender(kafka_server_ip_port, kafka_topic, kafka_task_id)
     init_progress_message_title(step_id, step_name)
     init_progress_message_source()
+    prg_sender.send({
+        'progress': 0,
+        'runningStatus': 'running',
+        'runningInfo': '变化检测任务已接收，正在初始化'
+    })
 
-    # 自动检测：如果输入为文件夹（目录），则进入批量处理模式
-    if os.path.isdir(pre_image) and os.path.isdir(post_image):
-        change_detection_folder(pre_image, post_image, model_path, dst_path, output_dataset)
-    else:
-        change_detection(pre_image, post_image, model_path, dst_path, output_dataset)
+    try:
+        # 自动检测：如果输入为文件夹（目录），则进入批量处理模式
+        if os.path.isdir(pre_image) and os.path.isdir(post_image):
+            change_detection_folder(pre_image, post_image, model_path, dst_path, output_dataset)
+        else:
+            change_detection(pre_image, post_image, model_path, dst_path, output_dataset)
+    except Exception as exc:
+        if _is_nonfatal_warning(exc):
+            warning_info = f'变化检测完成（存在告警）：{exc}'
+            swap_write('warning', str(exc))
+            prg_sender.send({
+                'progress': 100,
+                'runningStatus': 'completed',
+                'runningInfo': warning_info
+            })
+            return
+        prg_sender.send({
+            'progress': 100,
+            'runningStatus': 'failed',
+            'runningInfo': f'变化检测失败: {exc}'
+        })
+        raise
+    finally:
+        prg_sender.close()

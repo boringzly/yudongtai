@@ -708,8 +708,14 @@ def set_no_data_value(dataset, no_data_value=None):
         _band.SetNoDataValue(no_data_value)
         
 def build_overviews(dataset, overviewlist=[2,4,8,16,32,64,128]):
-    dataset.BuildOverviews('NEAREST', overviewlist=overviewlist)
-    dataset.FlushCache()
+    gdal.ErrorReset()
+    overview_result = dataset.BuildOverviews('NEAREST', overviewlist=overviewlist)
+    flush_result = dataset.FlushCache()
+    if (overview_result not in (None, 0)
+            or flush_result not in (None, 0)
+            or gdal.GetLastErrorType() >= gdal.CE_Failure):
+        error_message = gdal.GetLastErrorMsg() or 'unknown GDAL error'
+        raise RuntimeError(f'完成变化检测 BigTIFF 写盘失败: {error_message}')
 
 
 def test_lib_big_memeff(pre_img_path='', post_img_path='', output_path='', logger=None, callback_url=None, job_id=None,
@@ -1036,8 +1042,14 @@ def test_lib(local_rank, nrank, cfg, logger, progress_callback=None):
         # create result file
 
         driver = gdal.GetDriverByName('GTiff')
+        if driver is None:
+            raise RuntimeError('GDAL GTiff 驱动不可用')
+        gdal.ErrorReset()
         out_data = driver.Create(out_namelist[n], big_img_width, big_img_height, 1, gdal.GDT_Byte,
-                                 options=['COMPRESS=LZW'])
+                                 options=['COMPRESS=LZW', 'TILED=YES', 'BIGTIFF=YES'])
+        if out_data is None or gdal.GetLastErrorType() >= gdal.CE_Failure:
+            error_message = gdal.GetLastErrorMsg() or 'unknown GDAL error'
+            raise RuntimeError(f'创建变化检测 BigTIFF 失败: {error_message}')
         out_data.SetProjection(proj_post)
         out_data.SetGeoTransform(gt_post)
         set_color_table(out_data, [(0, 0, 0), (255, 255, 255)])
@@ -1093,8 +1105,14 @@ def test_lib(local_rank, nrank, cfg, logger, progress_callback=None):
                 else:
                     pred = pred[overlap_half:-int(pad_y), :]
                 _band = out_data.GetRasterBand(1)
-                _band.WriteArray(pred, int(clip_x.data), int(clip_y.data))
-                _band.FlushCache()
+                gdal.ErrorReset()
+                write_result = _band.WriteArray(pred, int(clip_x.data), int(clip_y.data))
+                flush_result = _band.FlushCache()
+                if (write_result not in (None, 0)
+                        or flush_result not in (None, 0)
+                        or gdal.GetLastErrorType() >= gdal.CE_Failure):
+                    error_message = gdal.GetLastErrorMsg() or 'unknown GDAL error'
+                    raise RuntimeError(f'写入变化检测 BigTIFF 失败: {error_message}')
             if local_rank == 0:
                 pbar.update()
                 total_batches = len(data_loader_test)

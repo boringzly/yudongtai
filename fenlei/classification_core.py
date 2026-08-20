@@ -4,6 +4,7 @@ import json
 import yaml
 import tempfile
 import shutil
+import subprocess
 
 # ========== Kafka 客户端 ==========
 try:
@@ -12,6 +13,25 @@ except:
     print('failed to load ProgressMessageSender package.')
     ProgressMessageSender = None
 prg_sender = None
+
+
+class NonFatalTaskWarning(RuntimeError):
+    """记录告警但不让当前工作流步骤以失败状态退出。"""
+
+
+def _is_nonfatal_warning(exc):
+    if isinstance(exc, NonFatalTaskWarning):
+        return True
+    message = str(exc).lower()
+    warning_markers = (
+        'maximum tiff file size exceeded',
+        'tiffappendtostrip',
+        'bigtiff',
+        '分类结果缺失',
+        '变化检测结果文件不存在',
+    )
+    return any(marker in message for marker in warning_markers)
+
 
 class ProgressMessageSenderWrap():
     
@@ -62,13 +82,16 @@ class ProgressMessageSenderWrap():
 
 def init_progress_message_sender(kafka_server_ip_port, kafka_topic, kafka_task_id):
     global prg_sender
-    prg_sender = ProgressMessageSenderWrap(kafka_server_ip_port, kafka_topic, kafka_task_id)
-    if kafka_server_ip_port:
-        os.environ['KAFKA_SERVER_IP_PORT'] = str(kafka_server_ip_port)
-    if kafka_topic:
-        os.environ['KAFKA_TOPIC'] = str(kafka_topic)
-    if kafka_task_id:
-        os.environ['KAFKA_TASK_ID'] = str(kafka_task_id)
+    bootstrap_servers = kafka_server_ip_port or os.environ.get('KAFKA_SERVER_IP_PORT', '')
+    topic = kafka_topic or os.environ.get('KAFKA_TOPIC', '')
+    task_id = kafka_task_id or os.environ.get('KAFKA_TASK_ID')
+    prg_sender = ProgressMessageSenderWrap(bootstrap_servers, topic, task_id)
+    if bootstrap_servers:
+        os.environ['KAFKA_SERVER_IP_PORT'] = str(bootstrap_servers)
+    if topic:
+        os.environ['KAFKA_TOPIC'] = str(topic)
+    if task_id:
+        os.environ['KAFKA_TASK_ID'] = str(task_id)
 
 def init_progress_message_title(step_id, step_name):
     title = None
@@ -109,14 +132,116 @@ def _send_completed(running_info):
     prg_sender.close()
 
 
+def _send_failed(running_info):
+    global prg_sender
+    message = {'progress': 100, 'runningStatus': 'failed', 'runningInfo': running_info}
+    print(f'[PROGRESS] sending failed message: {running_info}', flush=True)
+    sent = prg_sender.send(message)
+    print(f'[PROGRESS] failed message sent={sent}', flush=True)
+
+
 # ========== Swap 变量输出 ==========
 
 def swap_write(key, value):
     print(f"##SWAP:{key}={json.dumps(value, ensure_ascii=False)}", flush=True)
 
+
+_SHAPEFILE_SIDECARS = (
+    '.shp', '.shx', '.dbf', '.prj', '.cpg', '.qix', '.sbn', '.sbx', '.fix', '.shp.xml'
+)
+
+
+def _remove_shapefile_dataset(shp_path):
+    stem = os.path.splitext(str(shp_path))[0]
+    for extension in _SHAPEFILE_SIDECARS:
+        candidate = stem + extension
+        if os.path.isfile(candidate):
+            os.remove(candidate)
+
+
+def _remove_file_if_exists(path):
+    if os.path.isfile(path):
+        os.remove(path)
+
+
+_ACTIVE_CLASSIFICATION_TEMP_DIRS = set()
+
+
+def _create_classification_temp_dir():
+    temp_dir = tempfile.mkdtemp(prefix='clie_tmp_')
+    _ACTIVE_CLASSIFICATION_TEMP_DIRS.add(temp_dir)
+    return temp_dir
+
+
+def _cleanup_classification_temp_dir(temp_dir):
+    if not temp_dir:
+        return
+    shutil.rmtree(temp_dir, ignore_errors=True)
+    _ACTIVE_CLASSIFICATION_TEMP_DIRS.discard(temp_dir)
+
+
+def _cleanup_all_classification_temp_dirs():
+    for temp_dir in list(_ACTIVE_CLASSIFICATION_TEMP_DIRS):
+        _cleanup_classification_temp_dir(temp_dir)
+
+
+def _cleanup_clie_working_rasters(temp_dir):
+    """及时清理 CLIE 重采样产生的临时 BigTIFF，避免批量运行时持续累积。"""
+    shutil.rmtree(os.path.join(temp_dir, 'tmp'), ignore_errors=True)
+
+
+def _write_empty_classification_shp(output_shp, crs):
+    """创建带稳定字段的 UTF-8 空结果，确保无变化时仍有可用输出。"""
+    from osgeo import ogr, osr
+
+    os.makedirs(os.path.dirname(output_shp), exist_ok=True)
+    _remove_shapefile_dataset(output_shp)
+    driver = ogr.GetDriverByName('ESRI Shapefile')
+    if driver is None:
+        raise RuntimeError('OGR ESRI Shapefile 驱动不可用')
+    data_source = driver.CreateDataSource(output_shp)
+    if data_source is None:
+        raise RuntimeError(f'无法创建空分类结果: {output_shp}')
+
+    spatial_ref = None
+    if crs is not None:
+        spatial_ref = osr.SpatialReference()
+        crs_wkt = crs.to_wkt() if hasattr(crs, 'to_wkt') else str(crs)
+        if spatial_ref.SetFromUserInput(crs_wkt) != 0:
+            data_source = None
+            raise RuntimeError(f'无法解析空分类结果坐标系: {crs}')
+
+    layer = data_source.CreateLayer(
+        os.path.splitext(os.path.basename(output_shp))[0],
+        srs=spatial_ref,
+        geom_type=ogr.wkbPolygon,
+        options=['ENCODING=UTF-8'],
+    )
+    if layer is None:
+        data_source = None
+        raise RuntimeError(f'无法创建空分类结果图层: {output_shp}')
+
+    field_specs = (
+        ('uid', ogr.OFTInteger64, None),
+        ('pre_code', ogr.OFTInteger, None),
+        ('pre_name', ogr.OFTString, 32),
+        ('curr_code', ogr.OFTInteger, None),
+        ('curr_name', ogr.OFTString, 32),
+    )
+    for name, field_type, width in field_specs:
+        field = ogr.FieldDefn(name, field_type)
+        if width is not None:
+            field.SetWidth(width)
+        if layer.CreateField(field) != 0:
+            data_source = None
+            raise RuntimeError(f'无法创建空分类结果字段 {name}: {output_shp}')
+    data_source = None
+
+
 # ========== DatasetBuilder ==========
 
 from DatasetBuilder import DatasetBuilder
+from classification_schema import format_classification_result
 
 # ========== 算法主体 ==========
 
@@ -146,7 +271,7 @@ def _process_chunk(args):
             mapped_class = _map_class_code(original_major_class)
             major_classes.append(mapped_class)
         else:
-            major_classes.append(5)
+            major_classes.append(0)
     return list(gdf_chunk.index), major_classes
 
 
@@ -161,7 +286,6 @@ def classification(pre_image, post_image, mask_shp, model_path, dst_path, output
     import rasterio
     import geopandas as gpd
     import numpy as np
-    import subprocess
     import logging
 
     logger = logging.getLogger('classification')
@@ -174,25 +298,29 @@ def classification(pre_image, post_image, mask_shp, model_path, dst_path, output
     # 3. 读取变化检测结果
     prg_sender.send({'progress': 5, 'runningStatus': 'running', 'runningInfo': '读取变化检测结果SHP'})
 
+    if not os.path.exists(pre_image):
+        raise FileNotFoundError(f'前时相影像不存在: {pre_image}')
+    if not os.path.exists(post_image):
+        raise FileNotFoundError(f'后时相影像不存在: {post_image}')
     if not os.path.exists(mask_shp):
-        logger.info("变化检测结果文件不存在，跳过分类")
-        if output_dataset is not None:
-            ds = DatasetBuilder(output_dataset)
-            ds.add("result", dst_path, "vector")
-            ds.set_render(["result"])
-            ds.save()
-        _send_completed('变化检测结果不存在，跳过分类')
-        return
+        raise NonFatalTaskWarning(f'变化检测结果文件不存在: {mask_shp}')
 
     gdf = gpd.read_file(mask_shp)
     logger.info(f'变化地块数量：{len(gdf)}')
 
-    # 4. 如果无变化区域，不创建空输出，直接返回
+    pre_stem = Path(pre_image).stem
+    post_stem = Path(post_image).stem
+    out_shp_file = os.path.join(dst_path, f'{pre_stem}_{post_stem}_classified.shp')
+
+    # 4. 如果无变化区域，创建字段完整的空输出后返回。
     if len(gdf) == 0:
         logger.info("mask为空，没有变化区域可分类")
+        _write_empty_classification_shp(out_shp_file, gdf.crs)
+        swap_write('output_shp', out_shp_file)
+        swap_write('classified_count', 0)
         if output_dataset is not None:
             ds = DatasetBuilder(output_dataset)
-            ds.add("result", dst_path, "vector")
+            ds.add("result", dst_path, "vector", [Path(out_shp_file).name])
             ds.set_render(["result"])
             ds.save()
         _send_completed('无变化区域可分类')
@@ -208,7 +336,7 @@ def classification(pre_image, post_image, mask_shp, model_path, dst_path, output
     run_py = os.path.join(work_dir, "run.py")
     model_file = os.path.join(work_dir, "tools", "fullclass_chinaall_3b.pth")
 
-    tmprun_dir = tempfile.mkdtemp(prefix="clie_tmp_")
+    tmprun_dir = _create_classification_temp_dir()
     logger.info(f"分类临时目录: {tmprun_dir}")
 
     clie_env = os.environ.copy()
@@ -223,46 +351,60 @@ def classification(pre_image, post_image, mask_shp, model_path, dst_path, output
 
     # 6. 后时相影像分类
     prg_sender.send({'progress': 15, 'runningStatus': 'running', 'runningInfo': '后时相影像分类预测中'})
-    post_stem = Path(post_image).stem
     class_output_dir = os.path.join(tmprun_dir, "class_output")
     os.makedirs(class_output_dir, exist_ok=True)
 
     # CLIE 子进程进度映射到父进程的 15%→35% 区间
     clie_env['CLIE_PROGRESS_MIN'] = '15'
     clie_env['CLIE_PROGRESS_MAX'] = '35'
-    subprocess.run([
-        sys.executable, run_py, "run",
-        "--image_input_file", post_image,
-        "--image_output_dir", class_output_dir,
-        "--model_file", model_file,
-        "--error_log", os.path.join(tmprun_dir, "error.log"),
-        "--debug_file", os.path.join(tmprun_dir, "debug.txt"),
-    ], check=True, cwd=tmprun_dir, env=clie_env)
+    try:
+        subprocess.run([
+            sys.executable, run_py, "run",
+            "--image_input_file", post_image,
+            "--image_output_dir", class_output_dir,
+            "--model_file", model_file,
+            "--error_log", os.path.join(tmprun_dir, "error.log"),
+            "--debug_file", os.path.join(tmprun_dir, "debug.txt"),
+        ], check=True, cwd=tmprun_dir, env=clie_env)
+    except subprocess.CalledProcessError as exc:
+        _cleanup_classification_temp_dir(tmprun_dir)
+        raise NonFatalTaskWarning(
+            f'后时相分类子任务退出码 {exc.returncode}，已按告警跳过'
+        ) from exc
     tif_file2 = os.path.join(class_output_dir, f"{post_stem}.tif")
 
     if not os.path.exists(tif_file2):
-        _send_completed('后时相分类结果缺失')
-        shutil.rmtree(tmprun_dir, ignore_errors=True)
-        return
+        _cleanup_classification_temp_dir(tmprun_dir)
+        raise NonFatalTaskWarning(f'后时相分类结果缺失: {tif_file2}')
+    _cleanup_clie_working_rasters(tmprun_dir)
 
     # 7. 前时相影像分类
     prg_sender.send({'progress': 35, 'runningStatus': 'running', 'runningInfo': '前时相影像分类预测中'})
-    pre_stem = Path(pre_image).stem
     class_output_dir1 = os.path.join(tmprun_dir, "class_output", "time1")
     os.makedirs(class_output_dir1, exist_ok=True)
 
     # CLIE 子进程进度映射到父进程的 35%→55% 区间
     clie_env['CLIE_PROGRESS_MIN'] = '35'
     clie_env['CLIE_PROGRESS_MAX'] = '55'
-    subprocess.run([
-        sys.executable, run_py, "run",
-        "--image_input_file", pre_image,
-        "--image_output_dir", class_output_dir1,
-        "--model_file", model_file,
-        "--error_log", os.path.join(tmprun_dir, "error.log"),
-        "--debug_file", os.path.join(tmprun_dir, "debug.txt"),
-    ], check=True, cwd=tmprun_dir, env=clie_env)
+    try:
+        subprocess.run([
+            sys.executable, run_py, "run",
+            "--image_input_file", pre_image,
+            "--image_output_dir", class_output_dir1,
+            "--model_file", model_file,
+            "--error_log", os.path.join(tmprun_dir, "error.log"),
+            "--debug_file", os.path.join(tmprun_dir, "debug.txt"),
+        ], check=True, cwd=tmprun_dir, env=clie_env)
+    except subprocess.CalledProcessError as exc:
+        _cleanup_classification_temp_dir(tmprun_dir)
+        raise NonFatalTaskWarning(
+            f'前时相分类子任务退出码 {exc.returncode}，已按告警跳过'
+        ) from exc
     tif_file1 = os.path.join(class_output_dir1, f"{pre_stem}.tif")
+    if not os.path.exists(tif_file1):
+        _cleanup_classification_temp_dir(tmprun_dir)
+        raise NonFatalTaskWarning(f'前时相分类结果缺失: {tif_file1}')
+    _cleanup_clie_working_rasters(tmprun_dir)
 
     # 8. 并行计算前后时相类别
     prg_sender.send({'progress': 55, 'runningStatus': 'running', 'runningInfo': '计算前后时相各地块类别'})
@@ -313,7 +455,7 @@ def classification(pre_image, post_image, mask_shp, model_path, dst_path, output
     prg_sender.send({'progress': 90, 'runningStatus': 'running', 'runningInfo': '保存分类结果'})
 
     gdf = gdf.to_crs(origin_crs)
-    out_shp_file = os.path.join(dst_path, f'{pre_stem}_{post_stem}_classified.shp')
+    gdf = format_classification_result(gdf)
     os.makedirs(dst_path, exist_ok=True)
     gdf.to_file(out_shp_file, encoding="utf-8")
 
@@ -332,7 +474,7 @@ def classification(pre_image, post_image, mask_shp, model_path, dst_path, output
 
     # 11. 报告完成
     _send_completed('类别识别算法完成')
-    shutil.rmtree(tmprun_dir, ignore_errors=True)
+    _cleanup_classification_temp_dir(tmprun_dir)
 
 # ========== 批量类别识别（文件夹模式）==========
 
@@ -344,7 +486,6 @@ def classification_folder(pre_folder, post_folder, mask_folder, model_path, dst_
     import rasterio
     import geopandas as gpd
     import numpy as np
-    import subprocess
     import logging
     import multiprocessing as mp
 
@@ -358,21 +499,17 @@ def classification_folder(pre_folder, post_folder, mask_folder, model_path, dst_
 
     # 2. 检查输入文件夹
     if not pre_path.exists():
-        _send_completed(f'前时相文件夹不存在: {pre_folder}')
-        return
+        raise FileNotFoundError(f'前时相文件夹不存在: {pre_folder}')
     if not post_path.exists():
-        _send_completed(f'后时相文件夹不存在: {post_folder}')
-        return
+        raise FileNotFoundError(f'后时相文件夹不存在: {post_folder}')
     if not mask_path.exists():
-        _send_completed(f'掩码文件夹不存在: {mask_folder}')
-        return
+        raise FileNotFoundError(f'掩码文件夹不存在: {mask_folder}')
 
     # 3. 获取前时相影像文件列表
     pre_files = sorted(list(pre_path.glob("*.tif")) + list(pre_path.glob("*.tiff")))
 
     if not pre_files:
-        _send_completed(f'前时相文件夹中无影像文件: {pre_folder}')
-        return
+        raise RuntimeError(f'前时相文件夹中无影像文件: {pre_folder}')
 
     # 4. 匹配文件三元组（pre_tif, post_tif, mask_shp）
     valid_triples = []
@@ -393,8 +530,7 @@ def classification_folder(pre_folder, post_folder, mask_folder, model_path, dst_
 
     total = len(valid_triples)
     if total == 0:
-        _send_completed('未找到任何匹配的影像-掩码三元组')
-        return
+        raise RuntimeError('未找到任何匹配的影像-掩码三元组')
 
     swap_write('total_triples', total)
     if skipped_unmatched:
@@ -422,7 +558,7 @@ def classification_folder(pre_folder, post_folder, mask_folder, model_path, dst_
     run_py = os.path.join(work_dir, "run.py")
     model_file = os.path.join(work_dir, "tools", "fullclass_chinaall_3b.pth")
 
-    tmprun_dir = tempfile.mkdtemp(prefix="clie_tmp_")
+    tmprun_dir = _create_classification_temp_dir()
     logger.info(f"分类临时目录: {tmprun_dir}")
 
     clie_env = os.environ.copy()
@@ -453,6 +589,7 @@ def classification_folder(pre_folder, post_folder, mask_folder, model_path, dst_
         logger.info(f'Processing ({idx+1}/{total}): pre={pre_file}, post={post_file}, mask={mask_file} -> {output_shp}')
 
         try:
+            _remove_shapefile_dataset(output_shp)
             # --- 单组类别识别核心逻辑 ---
 
             # a. 读取变化检测结果
@@ -462,7 +599,7 @@ def classification_folder(pre_folder, post_folder, mask_folder, model_path, dst_
             # b. 如果无变化区域，保留空 SHP 文件供后续使用
             if len(gdf) == 0:
                 logger.info(f'  mask为空，没有变化区域，保留空分类结果: {stem}')
-                gdf.to_file(output_shp, encoding="utf-8")
+                _write_empty_classification_shp(output_shp, gdf.crs)
                 output_shp_list.append(output_shp)
                 continue
 
@@ -475,6 +612,9 @@ def classification_folder(pre_folder, post_folder, mask_folder, model_path, dst_
             logger.info(f'  后时相影像分类预测中...')
             class_output_dir = os.path.join(png_dir, f"{stem}_post")
             os.makedirs(class_output_dir, exist_ok=True)
+            shutil.rmtree(os.path.join(class_output_dir, 'out_preview'), ignore_errors=True)
+            tif_file2 = os.path.join(class_output_dir, f"{post_stem}.tif")
+            _remove_file_if_exists(tif_file2)
 
             # CLIE 子进程进度映射到当前 pair 的前半段
             _pair_start = prg_sender.calc_progress_value(idx, total, 5, 95)
@@ -482,7 +622,6 @@ def classification_folder(pre_folder, post_folder, mask_folder, model_path, dst_
             _pair_mid = _pair_start + (_pair_end - _pair_start) // 2
             clie_env['CLIE_PROGRESS_MIN'] = str(int(_pair_start))
             clie_env['CLIE_PROGRESS_MAX'] = str(int(_pair_mid))
-            clie_env['CLIE_PREVIEW_BASE'] = f"/png_cls/{stem}_post/out_preview"
             subprocess.run([
                 sys.executable, run_py, "run",
                 "--image_input_file", str(post_file),
@@ -491,20 +630,21 @@ def classification_folder(pre_folder, post_folder, mask_folder, model_path, dst_
                 "--error_log", os.path.join(tmprun_dir, f"error_{stem}.log"),
                 "--debug_file", os.path.join(tmprun_dir, f"debug_{stem}.txt"),
             ], check=True, cwd=tmprun_dir, env=clie_env)
-            tif_file2 = os.path.join(class_output_dir, f"{post_stem}.tif")
-
             if not os.path.exists(tif_file2):
                 raise FileNotFoundError(f'后时相分类结果缺失: {tif_file2}')
+            _cleanup_clie_working_rasters(tmprun_dir)
 
             # d. 前时相影像分类
             logger.info(f'  前时相影像分类预测中...')
             class_output_dir1 = os.path.join(png_dir, f"{stem}_pre")
             os.makedirs(class_output_dir1, exist_ok=True)
+            shutil.rmtree(os.path.join(class_output_dir1, 'out_preview'), ignore_errors=True)
+            tif_file1 = os.path.join(class_output_dir1, f"{stem}.tif")
+            _remove_file_if_exists(tif_file1)
 
             # CLIE 子进程进度映射到当前 pair 的后半段
             clie_env['CLIE_PROGRESS_MIN'] = str(int(_pair_mid))
             clie_env['CLIE_PROGRESS_MAX'] = str(int(_pair_end))
-            clie_env['CLIE_PREVIEW_BASE'] = f"/png_cls/{stem}_pre/out_preview"
             subprocess.run([
                 sys.executable, run_py, "run",
                 "--image_input_file", str(pre_file),
@@ -513,10 +653,9 @@ def classification_folder(pre_folder, post_folder, mask_folder, model_path, dst_
                 "--error_log", os.path.join(tmprun_dir, f"error_{stem}.log"),
                 "--debug_file", os.path.join(tmprun_dir, f"debug_{stem}.txt"),
             ], check=True, cwd=tmprun_dir, env=clie_env)
-            tif_file1 = os.path.join(class_output_dir1, f"{stem}.tif")
-
             if not os.path.exists(tif_file1):
                 raise FileNotFoundError(f'前时相分类结果缺失: {tif_file1}')
+            _cleanup_clie_working_rasters(tmprun_dir)
 
             # e. 统一坐标系
             with rasterio.open(tif_file2) as src:
@@ -558,6 +697,7 @@ def classification_folder(pre_folder, post_folder, mask_folder, model_path, dst_
 
             # g. 保存结果
             gdf = gdf.to_crs(origin_crs)
+            gdf = format_classification_result(gdf)
             os.makedirs(os.path.dirname(output_shp), exist_ok=True)
             gdf.to_file(output_shp, encoding="utf-8")
 
@@ -565,8 +705,16 @@ def classification_folder(pre_folder, post_folder, mask_folder, model_path, dst_
             output_shp_list.append(output_shp)
 
         except Exception as e:
-            logger.error(f'处理 {stem} 失败: {e}', exc_info=True)
+            logger.warning(f'处理 {stem} 出现告警，已跳过: {e}')
             failed_list.append({'file': stem, 'error': str(e)})
+        finally:
+            _cleanup_clie_working_rasters(tmprun_dir)
+
+    if failed_list:
+        swap_write('warning_list', failed_list)
+    if not output_shp_list:
+        _cleanup_classification_temp_dir(tmprun_dir)
+        raise RuntimeError(f'批量类别识别全部失败，0/{total} 组数据生成结果')
 
     # 8. 合并单个分类 SHP 为最终结果
     merged_shp = ""
@@ -578,7 +726,9 @@ def classification_folder(pre_folder, post_folder, mask_folder, model_path, dst_
         if _change_dir not in _sys.path:
             _sys.path.insert(0, _change_dir)
         from merge import merge_shp
-        merge_shp(output_shp_list, merged_shp)
+        merged_shp = merge_shp(output_shp_list, merged_shp)
+        if not merged_shp or not os.path.exists(merged_shp):
+            raise RuntimeError('合并分类结果后未生成有效 SHP')
 
     # 9. 输出 Swap 变量
     result_shp = merged_shp if merged_shp else shp_dir
@@ -587,9 +737,6 @@ def classification_folder(pre_folder, post_folder, mask_folder, model_path, dst_
     swap_write('output_shp_list', output_shp_list)
     swap_write('merged_shp', merged_shp)
     swap_write('processed_count', len(output_shp_list))
-    if failed_list:
-        swap_write('failed_list', failed_list)
-
     # 10. 输出 Dataset
     prg_sender.send({'progress': 99, 'runningStatus': 'running', 'runningInfo': '创建输出数据集'})
 
@@ -609,12 +756,12 @@ def classification_folder(pre_folder, post_folder, mask_folder, model_path, dst_
         ds.set_render(["result"])
         ds.save()
 
-    # 11. 报告完成
+    # 11. 单组数据失败按告警处理，不中断整个批量工作流。
     result_msg = f'批量类别识别完成，成功处理 {len(output_shp_list)}/{total} 组数据'
     if failed_list:
-        result_msg += f'，{len(failed_list)} 组失败'
+        result_msg += f'，{len(failed_list)} 组出现告警并已跳过'
     _send_completed(result_msg)
-    shutil.rmtree(tmprun_dir, ignore_errors=True)
+    _cleanup_classification_temp_dir(tmprun_dir)
 
 
 # ========== 入口函数 ==========
@@ -624,9 +771,26 @@ def entry(pre_image, post_image, mask_shp, model_path, dst_path, path_working, o
     init_progress_message_sender(kafka_server_ip_port, kafka_topic, kafka_task_id)
     init_progress_message_title(step_id, step_name)
     init_progress_message_source()
+    prg_sender.send({
+        'progress': 0,
+        'runningStatus': 'running',
+        'runningInfo': '类别识别任务已接收，正在初始化'
+    })
 
-    # 自动检测：如果输入为文件夹（目录），则进入批量处理模式
-    if os.path.isdir(pre_image) and os.path.isdir(post_image) and os.path.isdir(mask_shp):
-        classification_folder(pre_image, post_image, mask_shp, model_path, dst_path, path_working, output_dataset)
-    else:
-        classification(pre_image, post_image, mask_shp, model_path, dst_path, output_dataset)
+    try:
+        # 自动检测：如果输入为文件夹（目录），则进入批量处理模式
+        if os.path.isdir(pre_image) and os.path.isdir(post_image) and os.path.isdir(mask_shp):
+            classification_folder(pre_image, post_image, mask_shp, model_path, dst_path, path_working, output_dataset)
+        else:
+            classification(pre_image, post_image, mask_shp, model_path, dst_path, output_dataset)
+    except Exception as exc:
+        if _is_nonfatal_warning(exc):
+            warning_info = f'类别识别完成（存在告警）：{exc}'
+            swap_write('warning', str(exc))
+            _send_completed(warning_info)
+            return
+        _send_failed(f'类别识别失败: {exc}')
+        raise
+    finally:
+        _cleanup_all_classification_temp_dirs()
+        prg_sender.close()

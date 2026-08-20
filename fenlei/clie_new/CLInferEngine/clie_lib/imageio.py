@@ -77,11 +77,22 @@ class ImageWriter():
 
         options = []
         if driver == 'GTiff':
-            options.append(f'COMPRESS={compress}')
+            # 压缩后的最终大小无法可靠预估，IF_SAFER 仍可能在写入中途撞上 4GB 上限。
+            # 分类结果统一使用 BigTIFF，彻底避免 TIFFAppendToStrip 超限。
+            options.extend(['BIGTIFF=YES', 'TILED=YES'])
+            if compress:
+                options.append(f'COMPRESS={compress}')
         
         driver = gdal.GetDriverByName(driver)
+        if driver is None:
+            raise RuntimeError(f'GDAL driver is unavailable for output: {filename}')
+        gdal.ErrorReset()
         self.dataset = driver.Create(filename, width, height, nbands, type_dict[dtype], options=options)
+        if self.dataset is None or gdal.GetLastErrorType() >= gdal.CE_Failure:
+            error_message = gdal.GetLastErrorMsg() or 'unknown GDAL error'
+            raise RuntimeError(f'Failed to create raster {filename}: {error_message}')
 
+        self.filename = filename
         self.width = width
         self.height = height
         self.nbands = nbands
@@ -124,11 +135,24 @@ class ImageWriter():
 
         for i, band in enumerate(self.band_list):
             _band = self.dataset.GetRasterBand(i + 1)
-            _band.WriteArray(img[:, :, band - 1], *write_offset)
-            _band.FlushCache()
+            gdal.ErrorReset()
+            write_result = _band.WriteArray(img[:, :, band - 1], *write_offset)
+            flush_result = _band.FlushCache()
+            if (write_result not in (None, 0)
+                    or flush_result not in (None, 0)
+                    or gdal.GetLastErrorType() >= gdal.CE_Failure):
+                error_message = gdal.GetLastErrorMsg() or 'unknown GDAL error'
+                raise RuntimeError(f'Failed to write raster {self.filename}: {error_message}')
 
     def close(self):
-        del self.dataset
+        if self.dataset is None:
+            return
+        gdal.ErrorReset()
+        flush_result = self.dataset.FlushCache()
+        if flush_result not in (None, 0) or gdal.GetLastErrorType() >= gdal.CE_Failure:
+            error_message = gdal.GetLastErrorMsg() or 'unknown GDAL error'
+            raise RuntimeError(f'Failed to finalize raster {self.filename}: {error_message}')
+        self.dataset = None
 
     def build_overviews(self, overviewlist=[2,4,8,16,32,64,128]):
         self.dataset.BuildOverviews('NEAREST', overviewlist=overviewlist)

@@ -41,11 +41,12 @@ def process_tif(input_path, output_path):
     # 获取驱动器和创建输出数据集
     driver = gdal.GetDriverByName('GTiff')
     out_ds = driver.Create(
-        output_path, 
-        src_ds.RasterXSize, 
-        src_ds.RasterYSize, 
+        output_path,
+        src_ds.RasterXSize,
+        src_ds.RasterYSize,
         1,  # 波段数
-        band.DataType  # 数据类型
+        band.DataType,  # 数据类型
+        options=['COMPRESS=LZW', 'TILED=YES', 'BIGTIFF=YES']
     )
     
     # 设置地理参考信息

@@ -105,7 +105,7 @@ def resample_to_2m_gdal(image_path):
         resampleAlg="bilinear",
         multithread=True,
         format="GTiff",
-        creationOptions=["COMPRESS=LZW", "TILED=YES", "BIGTIFF=IF_SAFER"],
+        creationOptions=["COMPRESS=LZW", "TILED=YES", "BIGTIFF=YES"],
         targetAlignedPixels=True
     )
     if warp_tmp is None:
@@ -120,7 +120,7 @@ def resample_to_2m_gdal(image_path):
         resampleAlg="bilinear",
         multithread=True,
         format="GTiff",
-        creationOptions=["COMPRESS=LZW", "TILED=YES", "BIGTIFF=IF_SAFER"]
+        creationOptions=["COMPRESS=LZW", "TILED=YES", "BIGTIFF=YES"]
     )
     if warp_final is None:
         raise RuntimeError("投影回原始坐标失败")
@@ -179,14 +179,27 @@ def clip_and_mask_by_vector(image_path):
         width=x_res,
         height=y_res,
         dstSRS=image_sr.ExportToWkt(),
-        resampleAlg='bilinear'
+        resampleAlg='bilinear',
+        creationOptions=['COMPRESS=LZW', 'TILED=YES', 'BIGTIFF=YES']
     )
-    gdal.Warp(str(tmp_cut_path), src_ds, options=warp_options)
+    cut_result = gdal.Warp(str(tmp_cut_path), src_ds, options=warp_options)
+    if cut_result is None:
+        raise RuntimeError(f"裁剪分类影像失败: {tmp_cut_path}")
+    cut_result = None
 
     # 打开裁剪后图像，复制为输出影像
     cut_ds = gdal.Open(str(tmp_cut_path))
+    if cut_ds is None:
+        raise RuntimeError(f"无法打开裁剪后的分类影像: {tmp_cut_path}")
     driver = gdal.GetDriverByName("GTiff")
-    masked_ds = driver.CreateCopy(str(output_path), cut_ds, 0)
+    if driver is None:
+        raise RuntimeError("GDAL GTiff 驱动不可用")
+    masked_ds = driver.CreateCopy(
+        str(output_path), cut_ds, 0,
+        options=['COMPRESS=LZW', 'TILED=YES', 'BIGTIFF=YES']
+    )
+    if masked_ds is None:
+        raise RuntimeError(f"创建 BigTIFF 裁剪结果失败: {output_path}")
 
     # 创建内存数据源和图层
     mem_ds = ogr.GetDriverByName('Memory').CreateDataSource('mem')
@@ -230,6 +243,7 @@ class ProgressMessageSenderWrap():
         # 进度区间映射：默认 0→100（独立模式），子进程模式时由父进程通过环境变量设置
         self._progress_min = 0
         self._progress_max = 100
+        self._last_subprocess_progress_key = None
 
     def set_progress_range(self, progress_min, progress_max):
         """设置进度映射区间。当 max < 100 时自动抑制 completed 状态（子进程模式）。"""
@@ -250,21 +264,25 @@ class ProgressMessageSenderWrap():
             return self.prg_sender.get_task_id()
 
     def send(self, message_dict):
+        if self._is_subprocess_mode():
+            # 不生成瓦片缩略图；子进程仅按整数进度发送轻量消息。
+            if 'progress' not in message_dict:
+                return False
+            message_dict.pop('inferPreviewFilename', None)
+            # 子进程结束不代表整个分类步骤结束，避免提前把前端状态置为 completed。
+            message_dict['runningStatus'] = 'running'
+            message_dict['progress'] = self._map_progress(message_dict['progress'])
+            progress_key = (message_dict.get('inferFilename'), message_dict.get('progress'))
+            if progress_key == self._last_subprocess_progress_key:
+                return False
+            self._last_subprocess_progress_key = progress_key
+        elif 'progress' in message_dict:
+            message_dict['progress'] = self._map_progress(message_dict['progress'])
+
         if self.prg_sender is not None:
-            if self._is_subprocess_mode():
-                # 子进程模式下只发含预览/tile 信息的消息（inferGeoInfo + inferPreviewFilename），
-                # 其余 init/进度/completed 等消息全部丢弃，由父进程 classification_core 掌控主进度
-                if 'inferPreviewFilename' not in message_dict:
-                    return
-                if 'progress' in message_dict:
-                    message_dict['progress'] = self._map_progress(message_dict['progress'])
-            else:
-                # 独立模式：progress 正常透传
-                if 'progress' in message_dict:
-                    message_dict['progress'] = self._map_progress(message_dict['progress'])
-            self.prg_sender.send(message_dict)
-        else:
-            print(f'[SIMULATED SEND] {message_dict}')
+            return self.prg_sender.send(message_dict)
+        print(f'[SIMULATED SEND] {message_dict}', flush=True)
+        return False
 
     def close(self):
         if self.prg_sender is not None and hasattr(self.prg_sender, 'close'):
@@ -470,14 +488,6 @@ def infer(kwargs):
         except:
             logger.warning(
                 'Failed to create {} ! It maybe has been created by another thread.'.format(block_info_out_path))
-    # 预览 PNG 输出目录（前端通过 inferPreviewFilename 引用）
-    temp_preview_root = test_output_root + '/out_preview/'
-    try:
-        Utils.check_path(temp_preview_root, reset=False)
-    except:
-        logger.warning(
-            'Failed to create {} ! It maybe has been created by another thread.'.format(temp_preview_root))
-
     if _USE_DIST:
         t.distributed.barrier()
 
@@ -972,24 +982,10 @@ def infer(kwargs):
                 _infer_geo_info = f'POLYGON(({x1} {y1}, {x2} {y2}, {x3} {y3}, {x4} {y4}, {x1} {y1}))'
             infer_geo_info = f'[{_infer_geo_info}]'
 
-            # 生成 tile 预览 PNG（前端通过 inferPreviewFilename 引用）
-            scale = 1024 / (cfg.IMG_SIZE - cfg.PIXEL_OVERLAP)
-            _img_preview = cv2.resize(img_pred, dsize=None, fx=scale, fy=scale, interpolation=cv2.INTER_NEAREST)
-            img_preview = Utils.coloring3d(_img_preview, color_table)
-            if cfg.USE_TRANSPARENT_BACKGROUND:
-                _img_alpha = _img_preview.copy()[:, :, None]
-                _img_alpha[_img_alpha != 0] = 255
-                img_preview = np.append(img_preview, _img_alpha, axis=2)
-            _preview_base = os.environ.get('CLIE_PREVIEW_BASE', '/out_preview')
-            _infer_preview_filename = f'{_preview_base}/{basename}_{idx_x}.png'
-            temp_preview_filename = f'{temp_preview_root}/{basename}_{idx_x}.png'
-            cv2.imwrite(temp_preview_filename, img_preview)
-
             _prg_idx = prg_sender.calc_progress_value(idx_x + 1, len(test_dataloader), min_value=_sub_task_prg_min, max_value=_sub_task_prg_max)
             _sub_prg_idx = prg_sender.calc_progress_value(idx_x + 1, len(test_dataloader), min_value=0, max_value=99)
             message_dict = {'progress': _prg_idx, 'runningStatus': 'running', 'runningInfo': f'推理任务-{idx + 1}/{len(basename_list_list[local_rank])}',
                             'inferProgress': _sub_prg_idx, 'inferFilename': filename,
-                            'inferPreviewFilename': _infer_preview_filename,
                             'inferGeoInfo': infer_geo_info}
             prg_sender.send(message_dict)
 
@@ -1003,25 +999,27 @@ def infer(kwargs):
             tqdm.write('[INFO] %s  Writing: %s' % (time.strftime('[%y%m%d_%H:%M:%S]'), full_out_filename))
             try:
                 image_writer_full.close()
-            except:
+            except Exception as exc:
                 tqdm.write('[WARNING] ' + time.strftime('[%y%m%d_%H:%M:%S]') + '  Failed to write ' + full_out_filename)
                 if cfg.ERROR_LOG is not None:
                     with open(cfg.ERROR_LOG, 'a') as f:
                         f.write('[WARNING] ' + time.strftime(
                             '[%y%m%d_%H:%M:%S]') + '  Failed to write ' + full_out_filename)
+                raise RuntimeError(f'分类结果写盘失败: {full_out_filename}: {exc}') from exc
 
         if cfg.USE_SINGLE_OUT:
             single_out_filename = single_out_root + '/' + basename + output_suffix
             tqdm.write('[INFO] %s  Writing: %s' % (time.strftime('[%y%m%d_%H:%M:%S]'), single_out_filename))
             try:
                 image_writer_single.close()
-            except:
+            except Exception as exc:
                 tqdm.write(
                     '[WARNING] ' + time.strftime('[%y%m%d_%H:%M:%S]') + '  Failed to write ' + single_out_filename)
                 if cfg.ERROR_LOG is not None:
                     with open(cfg.ERROR_LOG, 'a') as f:
                         f.write('[WARNING] ' + time.strftime(
                             '[%y%m%d_%H:%M:%S]') + '  Failed to write ' + single_out_filename)
+                raise RuntimeError(f'分类结果写盘失败: {single_out_filename}: {exc}') from exc
 
         if cfg.USE_COLOR_OUT:
             color_out_filename = color_out_root + '/' + basename + output_suffix
@@ -1041,13 +1039,14 @@ def infer(kwargs):
                     shp_path = os.path.join(line_path, basename + '.shp')
                     Utils.check_path(line_path, reset=True)
                     raster2LineShp(center_path, shp_path)
-            except:
+            except Exception as exc:
                 logger.warning(
                     time.strftime('[%y%m%d_%H:%M:%S]') + '  Failed to write ' + color_out_filename)
                 if cfg.ERROR_LOG is not None:
                     with open(cfg.ERROR_LOG, 'a') as f:
                         f.write('[WARNING] ' + time.strftime(
                             '[%y%m%d_%H:%M:%S]') + '  Failed to write ' + color_out_filename)
+                raise RuntimeError(f'分类结果写盘或后处理失败: {color_out_filename}: {exc}') from exc
             #filter_color_from_tif(color_out_filename)
             logger.setStageAndProcess("tifName", "100").info(color_out_filename)
 
