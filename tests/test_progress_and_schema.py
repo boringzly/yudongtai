@@ -299,6 +299,22 @@ class EntryProgressTests(unittest.TestCase):
                 self.assertIn("if not output_shp_list:", source)
                 self.assertIn(expected_message, source)
 
+    def test_change_detection_does_not_report_95_before_zero_success_check(self):
+        source = (ROOT / "change" / "change_detection_core.py").read_text(encoding="utf-8")
+        zero_success_check = source.index("if not output_shp_list:")
+        report_95 = source.index("'progress': 95", zero_success_check)
+        self.assertLess(zero_success_check, report_95)
+        self.assertIn("'progress': 97", source)
+        self.assertIn("'progress': 99", source)
+        self.assertIn("正在生成变化检测输出数据集", source)
+
+    def test_spatial_validation_errors_are_not_silently_returned(self):
+        source = (
+            ROOT / "change" / "test_lib_batch_memeff_single_image_nomp.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn('raise RuntimeError("两幅图像无空间交集，无法执行变化检测")', source)
+        self.assertIn("raise RuntimeError(error_message) from e", source)
+
     def test_stale_shapefile_sidecars_are_removed(self):
         source_path = ROOT / "change" / "change_detection_core.py"
         tree = ast.parse(source_path.read_text(encoding="utf-8"))

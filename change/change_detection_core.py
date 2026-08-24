@@ -336,23 +336,25 @@ def change_detection_folder(pre_folder, post_folder, model_path, dst_path, outpu
             logger.warning(f'处理 {stem} 出现告警，已跳过: {e}')
             failed_list.append({'file': stem, 'error': str(e)})
 
-    # 7. 不合并结果，保留单个 SHP 文件供后续分类使用
-    prg_sender.send({'progress': 95, 'runningStatus': 'running', 'runningInfo': '跳过合并，保留单个变化检测结果'})
-
-    # 8. 输出 Swap 变量
-    swap_write('output_shp', shp_dir)    # 下游分类通过 glob 按 stem 匹配单个 SHP
-    swap_write('output_shp_list', output_shp_list)
-    swap_write('output_tif', tif_dir)
+    # 7. 先判断是否存在有效结果，避免全失败任务先显示为 95%。
     swap_write('processed_count', len(output_shp_list))
     if failed_list:
         swap_write('warning_list', failed_list)
-
-    # 部分失败继续运行；如果一项有效结果都没有，说明是系统性失败，不能伪装成 completed。
     if not output_shp_list:
         raise RuntimeError(f'批量变化检测全部失败，0/{total} 对影像生成结果')
 
+    # 8. 部分失败可以继续；保留每个有效的变化检测结果，不执行合并。
+    prg_sender.send({
+        'progress': 95,
+        'runningStatus': 'running',
+        'runningInfo': f'变化检测推理完成，正在整理 {len(output_shp_list)} 个结果'
+    })
+    swap_write('output_shp', shp_dir)    # 下游分类通过 glob 按 stem 匹配单个 SHP
+    swap_write('output_shp_list', output_shp_list)
+    swap_write('output_tif', tif_dir)
+
     # 9. 输出 Dataset
-    prg_sender.send({'progress': 99, 'runningStatus': 'running', 'runningInfo': '创建输出数据集'})
+    prg_sender.send({'progress': 97, 'runningStatus': 'running', 'runningInfo': '正在生成变化检测输出数据集'})
 
     if output_dataset is not None:
         result_files = sorted(p.name for p in Path(shp_dir).glob("*.shp") if p.is_file())
@@ -360,6 +362,8 @@ def change_detection_folder(pre_folder, post_folder, model_path, dst_path, outpu
         ds.add("result", shp_dir, "vector", result_files)
         ds.set_render(["result"])
         ds.save()
+
+    prg_sender.send({'progress': 99, 'runningStatus': 'running', 'runningInfo': '变化检测结果已生成，等待步骤完成'})
 
     # 10. 单个影像失败按告警处理，不中断整个批量工作流。
     result_msg = f'批量变化检测完成，成功处理 {len(output_shp_list)}/{total} 对影像'

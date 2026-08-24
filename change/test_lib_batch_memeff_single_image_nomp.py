@@ -736,30 +736,30 @@ def test_lib_big_memeff(pre_img_path='', post_img_path='', output_path='', logge
         post_data = gdal.Open(post_img_path)
         
         if pre_data is None:
-            logger.error(f"无法打开前时相图像: {pre_img_path}")
-            return
+            gdal_error = gdal.GetLastErrorMsg() or 'unknown GDAL error'
+            raise RuntimeError(f"无法打开前时相图像: {pre_img_path}: {gdal_error}")
 
         if post_data is None:
-            logger.error(f"无法打开后时相图像: {post_img_path}")
-            return
+            gdal_error = gdal.GetLastErrorMsg() or 'unknown GDAL error'
+            raise RuntimeError(f"无法打开后时相图像: {post_img_path}: {gdal_error}")
             
         # 计算空间交集
         #logger.info("===========计算空间交集=======")
         overlap_info = compute_intersection_info(pre_data, post_data)        
         if overlap_info is None:
-            # 没有空间交集，不创建空文件，直接返回
-            logger.info("两幅图像无空间交集，跳过推理")
-            pre_data = None
-            post_data = None
-            return
+            raise RuntimeError("两幅图像无空间交集，无法执行变化检测")
         
         # 如果有交集，继续正常处理
         pre_data = None
         post_data = None
         
     except Exception as e:
-        logger.error(f"检查图像交集时出错: {str(e)}")
-        return
+        pre_data = None
+        post_data = None
+        error_message = f"检查图像交集时出错: {e}"
+        if logger is not None:
+            logger.error(error_message)
+        raise RuntimeError(error_message) from e
     
     # 模型配置
     if logger is not None:
