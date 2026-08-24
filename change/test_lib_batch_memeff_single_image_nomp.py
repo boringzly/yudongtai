@@ -826,7 +826,9 @@ def test_lib_big_memeff(pre_img_path='', post_img_path='', output_path='', logge
         'with_fft': True,
         'THRESHOLD': 0.5,
         'BAND_NUM': 3,
-        'TEST_IMG_SIZE': 2560,
+        # 2560 像素切片在多进程 FFT 时会产生严重的内存带宽争用，首批数据数分钟无法返回。
+        # 1280 仍满足网络下采样倍数要求，单切片数据量降为 1/4，可更快开始 GPU 推理。
+        'TEST_IMG_SIZE': 1280,
         'TEST_PIXEL_OVERLAP': 0,
         'PRETRAINED': False,
         'TEMP_DIR_SUFFIX': temp_dir_suffix,  # 添加临时目录后缀配置

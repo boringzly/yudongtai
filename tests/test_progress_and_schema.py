@@ -399,6 +399,14 @@ class EntryProgressTests(unittest.TestCase):
         self.assertIn("finally:\n            if pair_scratch_dir is not None:", source)
         self.assertIn("shutil.rmtree(pair_scratch_dir, ignore_errors=True)", source)
 
+    def test_change_fft_tiles_are_small_enough_for_parallel_preprocessing(self):
+        source = (
+            ROOT / "change" / "test_lib_batch_memeff_single_image_nomp.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("'TEST_IMG_SIZE': 1280", source)
+        self.assertIn("'TEST_BATCHES': 1", source)
+        self.assertIn("'TEST_PREFETCH_FACTOR': 1", source)
+
     def test_classification_temp_dirs_are_cleaned_on_entry_exit(self):
         source_path = ROOT / "fenlei" / "classification_core.py"
         tree = ast.parse(source_path.read_text(encoding="utf-8"))
