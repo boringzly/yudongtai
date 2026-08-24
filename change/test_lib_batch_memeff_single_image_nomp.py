@@ -35,6 +35,44 @@ from schedule import post_status, post_progress
 # from secure.SecureCheck import secure_check
 # secure_check()
 
+
+def _available_cpu_count():
+    """返回当前容器实际可用的 CPU 数，兼容 cpuset、cgroup v1/v2。"""
+    counts = [os.cpu_count() or 1]
+
+    if hasattr(os, 'sched_getaffinity'):
+        try:
+            counts.append(len(os.sched_getaffinity(0)))
+        except (OSError, ValueError):
+            pass
+
+    try:
+        with open('/sys/fs/cgroup/cpu.max', 'r', encoding='ascii') as cpu_max_file:
+            quota_text, period_text = cpu_max_file.read().strip().split()[:2]
+        if quota_text != 'max':
+            quota = int(quota_text)
+            period = int(period_text)
+            if quota > 0 and period > 0:
+                counts.append(max(1, quota // period))
+    except (FileNotFoundError, OSError, ValueError):
+        try:
+            with open('/sys/fs/cgroup/cpu/cpu.cfs_quota_us', 'r', encoding='ascii') as quota_file:
+                quota = int(quota_file.read().strip())
+            with open('/sys/fs/cgroup/cpu/cpu.cfs_period_us', 'r', encoding='ascii') as period_file:
+                period = int(period_file.read().strip())
+            if quota > 0 and period > 0:
+                counts.append(max(1, quota // period))
+        except (FileNotFoundError, OSError, ValueError):
+            pass
+
+    return max(1, min(counts))
+
+
+def _recommended_dataloader_workers():
+    """使用约 80% 的容器 CPU，最多 24 个进程，避免内存和共享存储压力过大。"""
+    available_cpus = _available_cpu_count()
+    return max(1, min(24, int(available_cpus * 0.8)))
+
 def CalHistogram(img):
     
     img_dtype = img.dtype
@@ -777,7 +815,13 @@ def test_lib_big_memeff(pre_img_path='', post_img_path='', output_path='', logge
         'MODEL_NAME': 'FBCD',
         'MODEL_BACKBONE': 'vssm_tiny',
         'MODEL_NUM_CLASSES': 1,
-        'TEST_BATCHES': 4,
+        # FFT 预处理在 CPU 上执行。使用小 batch 可以让单个切片准备好后立即送入 GPU，
+        # 避免等待 4 个 2560x2560 切片全部完成后 GPU 才开始工作。
+        'TEST_BATCHES': 1,
+        # 根据 Pod 的 CPU 配额自动使用约 80%：16 CPU -> 12，30 CPU -> 24。
+        # 其余 CPU 留给主进程、GPU 喂数、GDAL 写出和消息线程。
+        'TEST_NUM_WORKERS': _recommended_dataloader_workers(),
+        'TEST_PREFETCH_FACTOR': 1,
         'WITH_TTA': False,
         'with_fft': True,
         'THRESHOLD': 0.5,
@@ -1037,8 +1081,21 @@ def test_lib(local_rank, nrank, cfg, logger, progress_callback=None):
         #import ipdb;ipdb.set_trace()
         # test_dataloader
         test_data = OnlineDataset(path_info, cfg.BAND_NUM, cfg.with_fft)
-        data_loader_test = torch.utils.data.DataLoader(test_data, cfg.TEST_BATCHES, shuffle=False, num_workers=2,
-                                                       pin_memory=True, prefetch_factor=10)
+        if logger is not None:
+            logger.info(
+                'DataLoader配置: batch_size=%s, num_workers=%s, prefetch_factor=%s',
+                cfg.TEST_BATCHES,
+                cfg.TEST_NUM_WORKERS,
+                cfg.TEST_PREFETCH_FACTOR,
+            )
+        data_loader_test = torch.utils.data.DataLoader(
+            test_data,
+            batch_size=cfg.TEST_BATCHES,
+            shuffle=False,
+            num_workers=cfg.TEST_NUM_WORKERS,
+            pin_memory=True,
+            prefetch_factor=cfg.TEST_PREFETCH_FACTOR,
+        )
         # create result file
 
         driver = gdal.GetDriverByName('GTiff')
