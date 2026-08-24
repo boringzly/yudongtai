@@ -2,6 +2,9 @@ import os
 import sys
 import json
 import yaml
+import shutil
+import tempfile
+import time
 
 try:
     from MessageClient.ProgressMessageSender import ProgressMessageSender
@@ -135,6 +138,80 @@ def _remove_shapefile_dataset(shp_path):
 def _remove_file_if_exists(path):
     if os.path.isfile(path):
         os.remove(path)
+
+
+_LOCAL_SCRATCH_RESERVE_BYTES = 10 * 1024 ** 3
+
+
+def _copy_file_atomically(source_path, destination_path):
+    """先复制到目标目录的临时文件，再原子替换，避免下游读到半个结果。"""
+    destination_path = str(destination_path)
+    destination_dir = os.path.dirname(destination_path) or '.'
+    os.makedirs(destination_dir, exist_ok=True)
+    file_descriptor, temporary_path = tempfile.mkstemp(
+        prefix=f'.{os.path.basename(destination_path)}.',
+        suffix='.copying',
+        dir=destination_dir,
+    )
+    os.close(file_descriptor)
+    try:
+        shutil.copy2(str(source_path), temporary_path)
+        os.replace(temporary_path, destination_path)
+    finally:
+        _remove_file_if_exists(temporary_path)
+
+
+def _copy_shapefile_dataset(source_shp, destination_shp):
+    """复制 Shapefile 及全部存在的附属文件。"""
+    source_stem = os.path.splitext(str(source_shp))[0]
+    destination_stem = os.path.splitext(str(destination_shp))[0]
+    if not os.path.isfile(source_stem + '.shp'):
+        raise FileNotFoundError(f'本地变化检测 SHP 不存在: {source_stem}.shp')
+
+    _remove_shapefile_dataset(destination_shp)
+    try:
+        for extension in _SHAPEFILE_SIDECARS:
+            source_file = source_stem + extension
+            if os.path.isfile(source_file):
+                _copy_file_atomically(source_file, destination_stem + extension)
+    except Exception:
+        _remove_shapefile_dataset(destination_shp)
+        raise
+
+
+def _create_local_pair_scratch(pre_path, post_path):
+    """为单对影像创建本地临时目录，并预留输入副本、临时结果和根盘安全空间。"""
+    scratch_root = os.environ.get('CHANGE_DETECTION_SCRATCH_DIR', '/tmp')
+    os.makedirs(scratch_root, exist_ok=True)
+    input_bytes = os.path.getsize(pre_path) + os.path.getsize(post_path)
+    # 除两份输入副本外，再按输入总大小预留重采样/结果空间，并保留至少 10 GiB。
+    required_bytes = input_bytes * 2 + _LOCAL_SCRATCH_RESERVE_BYTES
+    free_bytes = shutil.disk_usage(scratch_root).free
+    if free_bytes < required_bytes:
+        raise OSError(
+            f'本地临时盘空间不足: 可用 {free_bytes / 1024 ** 3:.1f} GiB，'
+            f'预计至少需要 {required_bytes / 1024 ** 3:.1f} GiB'
+        )
+    return tempfile.mkdtemp(prefix='change_detection_', dir=scratch_root)
+
+
+def _format_file_size(size_bytes):
+    size = float(max(0, size_bytes))
+    for unit in ('B', 'KB', 'MB', 'GB', 'TB'):
+        if size < 1024 or unit == 'TB':
+            return f'{size:.1f}{unit}'
+        size /= 1024
+
+
+def _format_duration(seconds):
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f'{hours}小时{minutes}分'
+    if minutes:
+        return f'{minutes}分{secs}秒'
+    return f'{secs}秒'
 
 
 # ========== DatasetBuilder ==========
@@ -287,6 +364,7 @@ def change_detection_folder(pre_folder, post_folder, model_path, dst_path, outpu
     for idx, (pre_path, post_path) in enumerate(valid_pairs):
         stem = pre_path.stem
         output_shp = os.path.join(shp_dir, f'{stem}.shp')
+        pair_started_at = time.monotonic()
 
         progress_pct = prg_sender.calc_progress_value(idx, total, 5, 95)
         prg_sender.send({
@@ -297,44 +375,122 @@ def change_detection_folder(pre_folder, post_folder, model_path, dst_path, outpu
 
         logger.info(f'Processing ({idx+1}/{total}): pre={pre_path}, post={post_path} -> {output_shp}')
 
-        def _make_batch_cb(_stem, _idx):
+        def _make_batch_cb(_stem, _idx, _tif_path, _pair_started_at, _inference_started_at):
             def _cb(current, total_patches):
                 inner_pct = current / max(total_patches, 1)
                 pct = prg_sender.calc_progress_value(_idx + inner_pct, total, 5, 95)
+                elapsed_pair = max(time.monotonic() - _pair_started_at, 0.001)
+                inference_elapsed = max(time.monotonic() - _inference_started_at, 0.001)
+                pair_eta = inference_elapsed / max(current, 1) * max(total_patches - current, 0)
+                estimated_pair_total = elapsed_pair + pair_eta
+                job_eta = pair_eta + estimated_pair_total * max(total - _idx - 1, 0)
+
+                tif_size = os.path.getsize(_tif_path) if os.path.isfile(_tif_path) else 0
+                estimated_tif_size = int(tif_size / max(current, 1) * total_patches)
+                running_info = (
+                    f'变化检测 ({_idx+1}/{total}) {_stem}: '
+                    f'{current}/{total_patches}切片，TIFF已写{_format_file_size(tif_size)}'
+                    f'（预计{_format_file_size(estimated_tif_size)}），'
+                    f'本图剩余约{_format_duration(pair_eta)}，任务剩余约{_format_duration(job_eta)}'
+                )
+                logger.info(running_info)
                 prg_sender.send({
                     'progress': pct,
                     'runningStatus': 'running',
-                    'runningInfo': f'变化检测中 ({_idx+1}/{total}): {_stem} ({current}/{total_patches} patches)'
+                    'runningInfo': running_info
                 })
             return _cb
 
+        pair_scratch_dir = None
         try:
-            tif_src = os.path.join(shp_dir, f'{stem}.tif')
+            shared_tif_src = os.path.join(shp_dir, f'{stem}.tif')
             tif_dst = os.path.join(tif_dir, f'{stem}.tif')
             _remove_shapefile_dataset(output_shp)
-            _remove_file_if_exists(tif_src)
+            _remove_file_if_exists(shared_tif_src)
             _remove_file_if_exists(tif_dst)
+
+            run_pre_path = str(pre_path)
+            run_post_path = str(post_path)
+            run_output_shp = output_shp
+            try:
+                pair_scratch_dir = _create_local_pair_scratch(pre_path, post_path)
+                local_pre_dir = os.path.join(pair_scratch_dir, 'input', 'pre')
+                local_post_dir = os.path.join(pair_scratch_dir, 'input', 'post')
+                local_output_dir = os.path.join(pair_scratch_dir, 'output')
+                os.makedirs(local_pre_dir, exist_ok=True)
+                os.makedirs(local_post_dir, exist_ok=True)
+                os.makedirs(local_output_dir, exist_ok=True)
+                run_pre_path = os.path.join(local_pre_dir, pre_path.name)
+                run_post_path = os.path.join(local_post_dir, post_path.name)
+                run_output_shp = os.path.join(local_output_dir, f'{stem}.shp')
+
+                prg_sender.send({
+                    'progress': progress_pct,
+                    'runningStatus': 'running',
+                    'runningInfo': f'正在将第 {idx+1}/{total} 对影像复制到本地临时盘'
+                })
+                logger.info('复制前时相影像到本地: %s -> %s', pre_path, run_pre_path)
+                shutil.copy2(str(pre_path), run_pre_path)
+                logger.info('复制后时相影像到本地: %s -> %s', post_path, run_post_path)
+                shutil.copy2(str(post_path), run_post_path)
+                logger.info('本地暂存完成，工作目录: %s', pair_scratch_dir)
+            except Exception as staging_error:
+                if pair_scratch_dir is not None:
+                    shutil.rmtree(pair_scratch_dir, ignore_errors=True)
+                pair_scratch_dir = None
+                run_pre_path = str(pre_path)
+                run_post_path = str(post_path)
+                run_output_shp = output_shp
+                logger.warning('本地暂存不可用，回退到共享盘直接处理: %s', staging_error)
+                prg_sender.send({
+                    'progress': progress_pct,
+                    'runningStatus': 'running',
+                    'runningInfo': f'本地暂存不可用，第 {idx+1}/{total} 对影像改用共享盘处理'
+                })
+
+            active_tif_path = os.path.join(os.path.dirname(run_output_shp), f'{stem}.tif')
+            inference_started_at = time.monotonic()
             test_lib_big_memeff(
-                pre_img_path=str(pre_path),
-                post_img_path=str(post_path),
-                output_path=output_shp,
+                pre_img_path=run_pre_path,
+                post_img_path=run_post_path,
+                output_path=run_output_shp,
                 logger=logger,
                 callback_url=None,
                 job_id=None,
                 temp_dir_suffix="tmp",
-                progress_callback=_make_batch_cb(stem, idx)
+                progress_callback=_make_batch_cb(
+                    stem,
+                    idx,
+                    active_tif_path,
+                    pair_started_at,
+                    inference_started_at,
+                )
             )
-            if os.path.exists(output_shp):
-                output_shp_list.append(output_shp)
-            else:
-                raise NonFatalTaskWarning(f'变化检测未生成结果文件: {output_shp}')
-            # 将推理产生的 tif 中间结果移动到 tif 目录
-            if os.path.exists(tif_src):
-                import shutil as _shutil
-                _shutil.move(tif_src, tif_dst)
+            if not os.path.exists(run_output_shp):
+                raise NonFatalTaskWarning(f'变化检测未生成结果文件: {run_output_shp}')
+
+            if pair_scratch_dir is not None:
+                prg_sender.send({
+                    'progress': prg_sender.calc_progress_value(idx + 1, total, 5, 95),
+                    'runningStatus': 'running',
+                    'runningInfo': f'第 {idx+1}/{total} 对推理完成，正在复制结果回共享盘'
+                })
+                if os.path.exists(active_tif_path):
+                    _copy_file_atomically(active_tif_path, tif_dst)
+                _copy_shapefile_dataset(run_output_shp, output_shp)
+            elif os.path.exists(shared_tif_src):
+                shutil.move(shared_tif_src, tif_dst)
+
+            if not os.path.exists(output_shp):
+                raise NonFatalTaskWarning(f'变化检测结果复制后缺失: {output_shp}')
+            output_shp_list.append(output_shp)
         except Exception as e:
             logger.warning(f'处理 {stem} 出现告警，已跳过: {e}')
             failed_list.append({'file': stem, 'error': str(e)})
+        finally:
+            if pair_scratch_dir is not None:
+                shutil.rmtree(pair_scratch_dir, ignore_errors=True)
+                logger.info('已清理本地临时目录: %s', pair_scratch_dir)
 
     # 7. 先判断是否存在有效结果，避免全失败任务先显示为 95%。
     swap_write('processed_count', len(output_shp_list))

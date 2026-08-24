@@ -346,6 +346,59 @@ class EntryProgressTests(unittest.TestCase):
             self.assertTrue(all(not path.exists() for path in sidecars))
             self.assertTrue(unrelated.exists())
 
+    def test_local_change_results_copy_all_shapefile_sidecars_atomically(self):
+        source_path = ROOT / "change" / "change_detection_core.py"
+        tree = ast.parse(source_path.read_text(encoding="utf-8"))
+        helper_names = {
+            "_remove_shapefile_dataset",
+            "_remove_file_if_exists",
+            "_copy_file_atomically",
+            "_copy_shapefile_dataset",
+        }
+        selected_nodes = [
+            node
+            for node in tree.body
+            if (
+                isinstance(node, ast.Assign)
+                and any(
+                    isinstance(target, ast.Name) and target.id == "_SHAPEFILE_SIDECARS"
+                    for target in node.targets
+                )
+            )
+            or (isinstance(node, ast.FunctionDef) and node.name in helper_names)
+        ]
+        namespace = {"os": os, "shutil": __import__("shutil"), "tempfile": tempfile}
+        exec(
+            compile(ast.Module(body=selected_nodes, type_ignores=[]), str(source_path), "exec"),
+            namespace,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_shp = Path(temp_dir) / "local" / "result.shp"
+            destination_shp = Path(temp_dir) / "shared" / "result.shp"
+            source_shp.parent.mkdir()
+            destination_shp.parent.mkdir()
+            for extension in (".shp", ".shx", ".dbf", ".prj", ".cpg"):
+                source_shp.with_suffix(extension).write_text(extension, encoding="utf-8")
+            destination_shp.with_suffix(".shx").write_text("stale", encoding="utf-8")
+
+            namespace["_copy_shapefile_dataset"](source_shp, destination_shp)
+
+            for extension in (".shp", ".shx", ".dbf", ".prj", ".cpg"):
+                self.assertEqual(
+                    destination_shp.with_suffix(extension).read_text(encoding="utf-8"),
+                    extension,
+                )
+            self.assertFalse(any(destination_shp.parent.glob("*.copying")))
+
+    def test_change_progress_reports_tiff_size_and_eta_and_cleans_scratch(self):
+        source = (ROOT / "change" / "change_detection_core.py").read_text(encoding="utf-8")
+        self.assertIn("os.path.getsize(_tif_path)", source)
+        self.assertIn("TIFF已写", source)
+        self.assertIn("任务剩余约", source)
+        self.assertIn("finally:\n            if pair_scratch_dir is not None:", source)
+        self.assertIn("shutil.rmtree(pair_scratch_dir, ignore_errors=True)", source)
+
     def test_classification_temp_dirs_are_cleaned_on_entry_exit(self):
         source_path = ROOT / "fenlei" / "classification_core.py"
         tree = ast.parse(source_path.read_text(encoding="utf-8"))

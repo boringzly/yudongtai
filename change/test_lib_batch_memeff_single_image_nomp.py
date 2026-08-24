@@ -968,7 +968,8 @@ def test_lib(local_rank, nrank, cfg, logger, progress_callback=None):
         #print(gt_rot_pre == gt_rot_post)
         if  gt_str_range_pre == gt_str_range_post and (
                 res_gapx + res_gapy == 0 and gt_rot_pre == gt_rot_post):
-            print("123")
+            if logger is not None:
+                logger.info('前后时相影像网格一致，开始生成切片并并行预处理')
         elif gt_str_range_pre != gt_str_range_post and (
                 res_gapx + res_gapy == 0 and gt_rot_pre == gt_rot_post):
             overlap_info = compute_intersection_info(pre_data, post_data)
@@ -1174,9 +1175,8 @@ def test_lib(local_rank, nrank, cfg, logger, progress_callback=None):
                 pbar.update()
                 total_batches = len(data_loader_test)
                 if progress_callback is not None and total_batches > 0:
-                    # 约每 10% 的 batch 汇报一次进度，或每批次都汇报
-                    if idx % max(1, total_batches // 10) == 0 or idx == total_batches - 1:
-                        progress_callback(idx + 1, total_batches)
+                    # 每个 batch 写入并刷新后汇报，供前端显示 TIFF 大小和动态 ETA。
+                    progress_callback(idx + 1, total_batches)
         build_overviews(out_data)
         del test_data.predataset
         del test_data.postdataset
