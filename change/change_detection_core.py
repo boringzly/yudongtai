@@ -5,6 +5,9 @@ import yaml
 import shutil
 import tempfile
 import time
+import logging
+import traceback
+from pathlib import Path
 
 try:
     from MessageClient.ProgressMessageSender import ProgressMessageSender
@@ -12,6 +15,74 @@ except:
     print('failed to load ProgressMessageSender package.')
     ProgressMessageSender = None
 prg_sender = None
+
+
+def _ensure_log_dir(dst_path):
+    resolved_dst = Path(dst_path).resolve()
+    task_root = resolved_dst
+    for candidate in (resolved_dst, *resolved_dst.parents):
+        if candidate.name.lower() == 'working':
+            task_root = candidate.parent
+            break
+    log_dir = task_root / 'logs'
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return str(log_dir)
+
+
+def _configure_persistent_logger(name, dst_path, filename='change_detection.log'):
+    """同时写 stdout 和任务输出目录，Pod 退出后仍可追溯。"""
+    log_path = os.path.join(_ensure_log_dir(dst_path), filename)
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(name)s: %(message)s')
+
+    if not any(type(handler) is logging.StreamHandler for handler in logger.handlers):
+        stream_handler = logging.StreamHandler()
+        stream_handler.setFormatter(formatter)
+        logger.addHandler(stream_handler)
+
+    target_path = os.path.normcase(os.path.abspath(log_path))
+    for handler in list(logger.handlers):
+        if isinstance(handler, logging.FileHandler):
+            handler_path = os.path.normcase(os.path.abspath(handler.baseFilename))
+            if handler_path == target_path:
+                break
+            logger.removeHandler(handler)
+            handler.close()
+    else:
+        file_handler = logging.FileHandler(log_path, mode='a', encoding='utf-8')
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+    return logger, log_path
+
+
+def _write_diagnostic_report(dst_path, filename, payload):
+    try:
+        report_path = os.path.join(_ensure_log_dir(dst_path), filename)
+        temp_path = report_path + '.tmp'
+        with open(temp_path, 'w', encoding='utf-8') as report_file:
+            json.dump(payload, report_file, ensure_ascii=False, indent=2)
+        os.replace(temp_path, report_path)
+        return report_path
+    except Exception as report_error:
+        print(f'[WARNING] 保存诊断报告失败 {filename}: {report_error}', file=sys.stderr, flush=True)
+        return None
+
+
+def _shapefile_feature_count(shp_path):
+    from osgeo import ogr
+
+    data_source = ogr.Open(str(shp_path), 0)
+    if data_source is None:
+        raise RuntimeError(f'无法打开变化检测 SHP: {shp_path}')
+    layer = data_source.GetLayer()
+    if layer is None:
+        data_source = None
+        raise RuntimeError(f'变化检测 SHP 不包含有效图层: {shp_path}')
+    feature_count = int(layer.GetFeatureCount())
+    data_source = None
+    return feature_count
 
 
 class NonFatalTaskWarning(RuntimeError):
@@ -246,13 +317,8 @@ def change_detection(pre_image, post_image, model_path, dst_path, output_dataset
     prg_sender.send({'progress': 10, 'runningStatus': 'running', 'runningInfo': '加载模型并执行变化检测推理'})
 
     from test_lib_batch_memeff_single_image_nomp import test_lib_big_memeff
-    import logging
-    logger = logging.getLogger('change_detection')
-    logger.setLevel(logging.INFO)
-    if not logger.handlers:
-        handler = logging.StreamHandler()
-        handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s: %(message)s'))
-        logger.addHandler(handler)
+    logger, log_path = _configure_persistent_logger('change_detection', dst_path)
+    logger.info('持久化日志: %s', log_path)
 
     def _cd_progress(current, total):
         pct = prg_sender.calc_progress_value(current, total, 15, 90)
@@ -270,13 +336,19 @@ def change_detection(pre_image, post_image, model_path, dst_path, output_dataset
         callback_url=None,
         job_id=None,
         temp_dir_suffix="tmp",
-        progress_callback=_cd_progress
+        progress_callback=_cd_progress,
+        model_path=model_path,
     )
 
     # 6. 检查结果是否生成。缺少产物记为告警，由入口返回 completed，避免中断工作流。
     if not os.path.exists(output_shp):
         swap_write('output_shp', output_shp)
         raise NonFatalTaskWarning(f'变化检测未生成结果文件: {output_shp}')
+
+    feature_count = _shapefile_feature_count(output_shp)
+    swap_write('change_count', feature_count)
+    if feature_count == 0:
+        logger.info('变化检测完成，但未检测到变化图斑；空 SHP 是有效的无变化结果')
 
     # 7. 输出 Swap 变量（输出文件路径供下游使用）
     swap_write('output_shp', output_shp)
@@ -292,6 +364,14 @@ def change_detection(pre_image, post_image, model_path, dst_path, output_dataset
         ds.set_render(["result"])
         ds.save()
 
+    _write_diagnostic_report(dst_path, 'change_detection_summary.json', {
+        'status': 'completed',
+        'mode': 'single',
+        'output_shp': output_shp,
+        'feature_count': feature_count,
+        'empty_result': feature_count == 0,
+    })
+
     # 9. 报告完成
     prg_sender.send({'progress': 100, 'runningStatus': 'completed', 'runningInfo': '变化检测算法完成'})
 
@@ -302,7 +382,6 @@ def change_detection_folder(pre_folder, post_folder, model_path, dst_path, outpu
     global prg_sender
 
     from pathlib import Path
-    import logging
 
     pre_folder = Path(pre_folder)
     post_folder = Path(post_folder)
@@ -348,18 +427,16 @@ def change_detection_folder(pre_folder, post_folder, model_path, dst_path, outpu
     os.makedirs(shp_dir, exist_ok=True)
     os.makedirs(tif_dir, exist_ok=True)
 
-    # 6. 设置日志
-    logger = logging.getLogger('change_detection_batch')
-    logger.setLevel(logging.INFO)
-    if not logger.handlers:
-        handler = logging.StreamHandler()
-        handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s: %(message)s'))
-        logger.addHandler(handler)
+    # 6. 设置持久化日志
+    logger, log_path = _configure_persistent_logger('change_detection_batch', dst_path)
+    logger.info('持久化日志: %s', log_path)
 
     from test_lib_batch_memeff_single_image_nomp import test_lib_big_memeff
 
     output_shp_list = []
     failed_list = []
+    empty_result_list = []
+    feature_counts = {}
 
     for idx, (pre_path, post_path) in enumerate(valid_pairs):
         stem = pre_path.stem
@@ -441,7 +518,11 @@ def change_detection_folder(pre_folder, post_folder, model_path, dst_path, outpu
                 run_pre_path = str(pre_path)
                 run_post_path = str(post_path)
                 run_output_shp = output_shp
-                logger.warning('本地暂存不可用，回退到共享盘直接处理: %s', staging_error)
+                logger.warning(
+                    '本地暂存不可用，回退到共享盘直接处理: %s',
+                    staging_error,
+                    exc_info=True,
+                )
                 prg_sender.send({
                     'progress': progress_pct,
                     'runningStatus': 'running',
@@ -464,7 +545,8 @@ def change_detection_folder(pre_folder, post_folder, model_path, dst_path, outpu
                     active_tif_path,
                     pair_started_at,
                     inference_started_at,
-                )
+                ),
+                model_path=model_path,
             )
             if not os.path.exists(run_output_shp):
                 raise NonFatalTaskWarning(f'变化检测未生成结果文件: {run_output_shp}')
@@ -483,9 +565,16 @@ def change_detection_folder(pre_folder, post_folder, model_path, dst_path, outpu
 
             if not os.path.exists(output_shp):
                 raise NonFatalTaskWarning(f'变化检测结果复制后缺失: {output_shp}')
+            feature_count = _shapefile_feature_count(output_shp)
+            feature_counts[stem] = feature_count
+            if feature_count == 0:
+                empty_result_list.append(stem)
+                logger.info('处理 %s 完成：未检测到变化图斑，输出有效空 SHP', stem)
+            else:
+                logger.info('处理 %s 完成：检测到 %s 个变化图斑', stem, feature_count)
             output_shp_list.append(output_shp)
         except Exception as e:
-            logger.warning(f'处理 {stem} 出现告警，已跳过: {e}')
+            logger.exception('处理 %s 失败，已跳过: %s', stem, e)
             failed_list.append({'file': stem, 'error': str(e)})
         finally:
             if pair_scratch_dir is not None:
@@ -496,7 +585,17 @@ def change_detection_folder(pre_folder, post_folder, model_path, dst_path, outpu
     swap_write('processed_count', len(output_shp_list))
     if failed_list:
         swap_write('warning_list', failed_list)
+    if empty_result_list:
+        swap_write('empty_result_list', empty_result_list)
     if not output_shp_list:
+        _write_diagnostic_report(dst_path, 'change_detection_summary.json', {
+            'status': 'failed',
+            'mode': 'batch',
+            'total': total,
+            'processed_count': 0,
+            'failed_count': len(failed_list),
+            'failed_results': failed_list,
+        })
         raise RuntimeError(f'批量变化检测全部失败，0/{total} 对影像生成结果')
 
     # 8. 部分失败可以继续；保留每个有效的变化检测结果，不执行合并。
@@ -519,10 +618,25 @@ def change_detection_folder(pre_folder, post_folder, model_path, dst_path, outpu
         ds.set_render(["result"])
         ds.save()
 
+    _write_diagnostic_report(dst_path, 'change_detection_summary.json', {
+        'status': 'completed_with_warnings' if failed_list else 'completed',
+        'mode': 'batch',
+        'total': total,
+        'processed_count': len(output_shp_list),
+        'failed_count': len(failed_list),
+        'empty_count': len(empty_result_list),
+        'empty_results': empty_result_list,
+        'failed_results': failed_list,
+        'feature_counts': feature_counts,
+        'output_shp_dir': shp_dir,
+    })
+
     prg_sender.send({'progress': 99, 'runningStatus': 'running', 'runningInfo': '变化检测结果已生成，等待步骤完成'})
 
     # 10. 单个影像失败按告警处理，不中断整个批量工作流。
     result_msg = f'批量变化检测完成，成功处理 {len(output_shp_list)}/{total} 对影像'
+    if empty_result_list:
+        result_msg += f'，其中 {len(empty_result_list)} 对未检测到变化'
     if failed_list:
         result_msg += f'，{len(failed_list)} 对出现告警并已跳过'
     prg_sender.send({'progress': 100, 'runningStatus': 'completed', 'runningInfo': result_msg})
@@ -532,6 +646,10 @@ def change_detection_folder(pre_folder, post_folder, model_path, dst_path, outpu
 
 def entry(pre_image, post_image, model_path, dst_path, output_dataset, step_id, step_name,
           kafka_server_ip_port, kafka_topic, kafka_task_id):
+    task_logger, log_path = _configure_persistent_logger('change_task', dst_path)
+    task_logger.info('变化检测任务开始；持久化日志: %s', log_path)
+    task_logger.info('输入: pre=%s, post=%s, dst=%s', pre_image, post_image, dst_path)
+    print(f'[LOG] 变化检测日志已保存到: {log_path}', flush=True)
     init_progress_message_sender(kafka_server_ip_port, kafka_topic, kafka_task_id)
     init_progress_message_title(step_id, step_name)
     init_progress_message_source()
@@ -549,6 +667,13 @@ def entry(pre_image, post_image, model_path, dst_path, output_dataset, step_id, 
             change_detection(pre_image, post_image, model_path, dst_path, output_dataset)
     except Exception as exc:
         if _is_nonfatal_warning(exc):
+            task_logger.exception('变化检测以告警状态结束: %s', exc)
+            _write_diagnostic_report(dst_path, 'change_detection_warning.json', {
+                'status': 'completed_with_warning',
+                'error_type': type(exc).__name__,
+                'error': str(exc),
+                'traceback': traceback.format_exc(),
+            })
             warning_info = f'变化检测完成（存在告警）：{exc}'
             swap_write('warning', str(exc))
             prg_sender.send({
@@ -557,6 +682,13 @@ def entry(pre_image, post_image, model_path, dst_path, output_dataset, step_id, 
                 'runningInfo': warning_info
             })
             return
+        task_logger.exception('变化检测失败: %s', exc)
+        _write_diagnostic_report(dst_path, 'change_detection_failure.json', {
+            'status': 'failed',
+            'error_type': type(exc).__name__,
+            'error': str(exc),
+            'traceback': traceback.format_exc(),
+        })
         prg_sender.send({
             'progress': 100,
             'runningStatus': 'failed',

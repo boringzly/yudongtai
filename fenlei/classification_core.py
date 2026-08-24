@@ -5,6 +5,9 @@ import yaml
 import tempfile
 import shutil
 import subprocess
+import logging
+import traceback
+from pathlib import Path
 
 # ========== Kafka 客户端 ==========
 try:
@@ -13,6 +16,102 @@ except:
     print('failed to load ProgressMessageSender package.')
     ProgressMessageSender = None
 prg_sender = None
+
+
+def _ensure_log_dir(dst_path):
+    resolved_dst = Path(dst_path).resolve()
+    task_root = resolved_dst
+    for candidate in (resolved_dst, *resolved_dst.parents):
+        if candidate.name.lower() == 'working':
+            task_root = candidate.parent
+            break
+    log_dir = task_root / 'logs'
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return str(log_dir)
+
+
+def _configure_persistent_logger(name, dst_path, filename='classification.log'):
+    """同时写 stdout 和任务输出目录，Pod 退出后仍可追溯。"""
+    log_path = os.path.join(_ensure_log_dir(dst_path), filename)
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(name)s: %(message)s')
+
+    if not any(type(handler) is logging.StreamHandler for handler in logger.handlers):
+        stream_handler = logging.StreamHandler()
+        stream_handler.setFormatter(formatter)
+        logger.addHandler(stream_handler)
+
+    target_path = os.path.normcase(os.path.abspath(log_path))
+    for handler in list(logger.handlers):
+        if isinstance(handler, logging.FileHandler):
+            handler_path = os.path.normcase(os.path.abspath(handler.baseFilename))
+            if handler_path == target_path:
+                break
+            logger.removeHandler(handler)
+            handler.close()
+    else:
+        file_handler = logging.FileHandler(log_path, mode='a', encoding='utf-8')
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+    return logger, log_path
+
+
+def _write_diagnostic_report(dst_path, filename, payload):
+    try:
+        report_path = os.path.join(_ensure_log_dir(dst_path), filename)
+        temp_path = report_path + '.tmp'
+        with open(temp_path, 'w', encoding='utf-8') as report_file:
+            json.dump(payload, report_file, ensure_ascii=False, indent=2)
+        os.replace(temp_path, report_path)
+        return report_path
+    except Exception as report_error:
+        print(f'[WARNING] 保存诊断报告失败 {filename}: {report_error}', file=sys.stderr, flush=True)
+        return None
+
+
+def _run_subprocess_logged(command, cwd, env, logger):
+    """实时转发 CLIE 输出，并把 stdout/stderr 完整写入持久化日志。"""
+    logger.info('启动分类子进程: %s', ' '.join(str(part) for part in command))
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding='utf-8',
+        errors='replace',
+        bufsize=1,
+    )
+    try:
+        for output_line in process.stdout:
+            logger.info('[CLIE] %s', output_line.rstrip('\r\n'))
+    finally:
+        if process.stdout is not None:
+            process.stdout.close()
+    return_code = process.wait()
+    if return_code != 0:
+        raise subprocess.CalledProcessError(return_code, command)
+    return return_code
+
+
+def _resolve_classification_model(model_path, work_dir):
+    """优先使用工作流传入模型；兼容旧版默认路径并记录实际使用文件。"""
+    candidates = []
+    if model_path:
+        requested_model = Path(model_path)
+        candidates.append(requested_model)
+        if not requested_model.is_absolute():
+            candidates.append(Path(work_dir) / requested_model)
+            candidates.append(Path(work_dir) / 'tools' / requested_model.name)
+    candidates.append(Path(work_dir) / 'tools' / 'fullclass_chinaall_3b.pth')
+    for candidate in candidates:
+        if candidate.is_file() or candidate.is_dir():
+            return str(candidate.resolve())
+    searched_paths = ', '.join(str(candidate) for candidate in candidates)
+    raise FileNotFoundError(f'分类模型不存在，已检查: {searched_paths}')
 
 
 class NonFatalTaskWarning(RuntimeError):
@@ -286,14 +385,9 @@ def classification(pre_image, post_image, mask_shp, model_path, dst_path, output
     import rasterio
     import geopandas as gpd
     import numpy as np
-    import logging
-
-    logger = logging.getLogger('classification')
-    logger.setLevel(logging.INFO)
-    if not logger.handlers:
-        handler = logging.StreamHandler()
-        handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s: %(message)s'))
-        logger.addHandler(handler)
+    logger, log_path = _configure_persistent_logger('classification', dst_path)
+    diagnostic_dir = _ensure_log_dir(dst_path)
+    logger.info('持久化日志: %s', log_path)
 
     # 3. 读取变化检测结果
     prg_sender.send({'progress': 5, 'runningStatus': 'running', 'runningInfo': '读取变化检测结果SHP'})
@@ -314,7 +408,7 @@ def classification(pre_image, post_image, mask_shp, model_path, dst_path, output
 
     # 4. 如果无变化区域，创建字段完整的空输出后返回。
     if len(gdf) == 0:
-        logger.info("mask为空，没有变化区域可分类")
+        logger.info("mask为空，没有变化区域可分类；空 SHP 是有效的无变化结果")
         _write_empty_classification_shp(out_shp_file, gdf.crs)
         swap_write('output_shp', out_shp_file)
         swap_write('classified_count', 0)
@@ -323,6 +417,15 @@ def classification(pre_image, post_image, mask_shp, model_path, dst_path, output
             ds.add("result", dst_path, "vector", [Path(out_shp_file).name])
             ds.set_render(["result"])
             ds.save()
+        _write_diagnostic_report(dst_path, 'classification_summary.json', {
+            'status': 'completed',
+            'mode': 'single',
+            'mask_shp': mask_shp,
+            'output_shp': out_shp_file,
+            'feature_count': 0,
+            'empty_result': True,
+            'reason': '变化检测结果不包含变化图斑',
+        })
         _send_completed('无变化区域可分类')
         return
 
@@ -334,7 +437,8 @@ def classification(pre_image, post_image, mask_shp, model_path, dst_path, output
     # 5. 准备 clie_new 推理环境（容器内 /app/module 为只读，所有输出重定向到可写目录）
     work_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "clie_new")
     run_py = os.path.join(work_dir, "run.py")
-    model_file = os.path.join(work_dir, "tools", "fullclass_chinaall_3b.pth")
+    model_file = _resolve_classification_model(model_path, work_dir)
+    logger.info('分类模型: %s', model_file)
 
     tmprun_dir = _create_classification_temp_dir()
     logger.info(f"分类临时目录: {tmprun_dir}")
@@ -358,14 +462,14 @@ def classification(pre_image, post_image, mask_shp, model_path, dst_path, output
     clie_env['CLIE_PROGRESS_MIN'] = '15'
     clie_env['CLIE_PROGRESS_MAX'] = '35'
     try:
-        subprocess.run([
+        _run_subprocess_logged([
             sys.executable, run_py, "run",
             "--image_input_file", post_image,
             "--image_output_dir", class_output_dir,
             "--model_file", model_file,
-            "--error_log", os.path.join(tmprun_dir, "error.log"),
-            "--debug_file", os.path.join(tmprun_dir, "debug.txt"),
-        ], check=True, cwd=tmprun_dir, env=clie_env)
+            "--error_log", os.path.join(diagnostic_dir, "clie_post_error.log"),
+            "--debug_file", os.path.join(diagnostic_dir, "clie_post_debug.txt"),
+        ], cwd=tmprun_dir, env=clie_env, logger=logger)
     except subprocess.CalledProcessError as exc:
         _cleanup_classification_temp_dir(tmprun_dir)
         raise NonFatalTaskWarning(
@@ -387,14 +491,14 @@ def classification(pre_image, post_image, mask_shp, model_path, dst_path, output
     clie_env['CLIE_PROGRESS_MIN'] = '35'
     clie_env['CLIE_PROGRESS_MAX'] = '55'
     try:
-        subprocess.run([
+        _run_subprocess_logged([
             sys.executable, run_py, "run",
             "--image_input_file", pre_image,
             "--image_output_dir", class_output_dir1,
             "--model_file", model_file,
-            "--error_log", os.path.join(tmprun_dir, "error.log"),
-            "--debug_file", os.path.join(tmprun_dir, "debug.txt"),
-        ], check=True, cwd=tmprun_dir, env=clie_env)
+            "--error_log", os.path.join(diagnostic_dir, "clie_pre_error.log"),
+            "--debug_file", os.path.join(diagnostic_dir, "clie_pre_debug.txt"),
+        ], cwd=tmprun_dir, env=clie_env, logger=logger)
     except subprocess.CalledProcessError as exc:
         _cleanup_classification_temp_dir(tmprun_dir)
         raise NonFatalTaskWarning(
@@ -472,6 +576,15 @@ def classification(pre_image, post_image, mask_shp, model_path, dst_path, output
         ds.set_render(["result"])
         ds.save()
 
+    _write_diagnostic_report(dst_path, 'classification_summary.json', {
+        'status': 'completed',
+        'mode': 'single',
+        'mask_shp': mask_shp,
+        'output_shp': out_shp_file,
+        'feature_count': len(gdf),
+        'empty_result': len(gdf) == 0,
+    })
+
     # 11. 报告完成
     _send_completed('类别识别算法完成')
     _cleanup_classification_temp_dir(tmprun_dir)
@@ -486,7 +599,6 @@ def classification_folder(pre_folder, post_folder, mask_folder, model_path, dst_
     import rasterio
     import geopandas as gpd
     import numpy as np
-    import logging
     import multiprocessing as mp
 
     pre_path = Path(pre_folder)
@@ -545,18 +657,16 @@ def classification_folder(pre_folder, post_folder, mask_folder, model_path, dst_
     os.makedirs(shp_dir, exist_ok=True)
     os.makedirs(png_dir, exist_ok=True)
 
-    # 6. 设置日志
-    logger = logging.getLogger('classification_batch')
-    logger.setLevel(logging.INFO)
-    if not logger.handlers:
-        handler = logging.StreamHandler()
-        handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s: %(message)s'))
-        logger.addHandler(handler)
+    # 6. 设置持久化日志
+    logger, log_path = _configure_persistent_logger('classification_batch', dst_path)
+    diagnostic_dir = _ensure_log_dir(dst_path)
+    logger.info('持久化日志: %s', log_path)
 
     # 7. 准备 clie_new 推理环境
     work_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "clie_new")
     run_py = os.path.join(work_dir, "run.py")
-    model_file = os.path.join(work_dir, "tools", "fullclass_chinaall_3b.pth")
+    model_file = _resolve_classification_model(model_path, work_dir)
+    logger.info('分类模型: %s', model_file)
 
     tmprun_dir = _create_classification_temp_dir()
     logger.info(f"分类临时目录: {tmprun_dir}")
@@ -573,6 +683,8 @@ def classification_folder(pre_folder, post_folder, mask_folder, model_path, dst_
 
     output_shp_list = []
     failed_list = []
+    empty_result_list = []
+    feature_counts = {}
 
     for idx, (pre_file, post_file, mask_file) in enumerate(valid_triples):
         stem = pre_file.stem
@@ -595,12 +707,14 @@ def classification_folder(pre_folder, post_folder, mask_folder, model_path, dst_
             # a. 读取变化检测结果
             gdf = gpd.read_file(str(mask_file))
             logger.info(f'  变化地块数量：{len(gdf)}')
+            feature_counts[stem] = len(gdf)
 
             # b. 如果无变化区域，保留空 SHP 文件供后续使用
             if len(gdf) == 0:
-                logger.info(f'  mask为空，没有变化区域，保留空分类结果: {stem}')
+                logger.info(f'  mask为空，没有变化区域，保留有效空分类结果: {stem}')
                 _write_empty_classification_shp(output_shp, gdf.crs)
                 output_shp_list.append(output_shp)
+                empty_result_list.append(stem)
                 continue
 
             gdf["uid"] = range(len(gdf))
@@ -622,14 +736,14 @@ def classification_folder(pre_folder, post_folder, mask_folder, model_path, dst_
             _pair_mid = _pair_start + (_pair_end - _pair_start) // 2
             clie_env['CLIE_PROGRESS_MIN'] = str(int(_pair_start))
             clie_env['CLIE_PROGRESS_MAX'] = str(int(_pair_mid))
-            subprocess.run([
+            _run_subprocess_logged([
                 sys.executable, run_py, "run",
                 "--image_input_file", str(post_file),
                 "--image_output_dir", class_output_dir,
                 "--model_file", model_file,
-                "--error_log", os.path.join(tmprun_dir, f"error_{stem}.log"),
-                "--debug_file", os.path.join(tmprun_dir, f"debug_{stem}.txt"),
-            ], check=True, cwd=tmprun_dir, env=clie_env)
+                "--error_log", os.path.join(diagnostic_dir, f"clie_{stem}_post_error.log"),
+                "--debug_file", os.path.join(diagnostic_dir, f"clie_{stem}_post_debug.txt"),
+            ], cwd=tmprun_dir, env=clie_env, logger=logger)
             if not os.path.exists(tif_file2):
                 raise FileNotFoundError(f'后时相分类结果缺失: {tif_file2}')
             _cleanup_clie_working_rasters(tmprun_dir)
@@ -645,14 +759,14 @@ def classification_folder(pre_folder, post_folder, mask_folder, model_path, dst_
             # CLIE 子进程进度映射到当前 pair 的后半段
             clie_env['CLIE_PROGRESS_MIN'] = str(int(_pair_mid))
             clie_env['CLIE_PROGRESS_MAX'] = str(int(_pair_end))
-            subprocess.run([
+            _run_subprocess_logged([
                 sys.executable, run_py, "run",
                 "--image_input_file", str(pre_file),
                 "--image_output_dir", class_output_dir1,
                 "--model_file", model_file,
-                "--error_log", os.path.join(tmprun_dir, f"error_{stem}.log"),
-                "--debug_file", os.path.join(tmprun_dir, f"debug_{stem}.txt"),
-            ], check=True, cwd=tmprun_dir, env=clie_env)
+                "--error_log", os.path.join(diagnostic_dir, f"clie_{stem}_pre_error.log"),
+                "--debug_file", os.path.join(diagnostic_dir, f"clie_{stem}_pre_debug.txt"),
+            ], cwd=tmprun_dir, env=clie_env, logger=logger)
             if not os.path.exists(tif_file1):
                 raise FileNotFoundError(f'前时相分类结果缺失: {tif_file1}')
             _cleanup_clie_working_rasters(tmprun_dir)
@@ -705,14 +819,25 @@ def classification_folder(pre_folder, post_folder, mask_folder, model_path, dst_
             output_shp_list.append(output_shp)
 
         except Exception as e:
-            logger.warning(f'处理 {stem} 出现告警，已跳过: {e}')
+            logger.exception('处理 %s 失败，已跳过: %s', stem, e)
             failed_list.append({'file': stem, 'error': str(e)})
         finally:
             _cleanup_clie_working_rasters(tmprun_dir)
 
     if failed_list:
         swap_write('warning_list', failed_list)
+    if empty_result_list:
+        swap_write('empty_result_list', empty_result_list)
     if not output_shp_list:
+        _write_diagnostic_report(dst_path, 'classification_summary.json', {
+            'status': 'failed',
+            'mode': 'batch',
+            'total': total,
+            'processed_count': 0,
+            'failed_count': len(failed_list),
+            'failed_results': failed_list,
+            'mask_feature_counts': feature_counts,
+        })
         _cleanup_classification_temp_dir(tmprun_dir)
         raise RuntimeError(f'批量类别识别全部失败，0/{total} 组数据生成结果')
 
@@ -756,8 +881,23 @@ def classification_folder(pre_folder, post_folder, mask_folder, model_path, dst_
         ds.set_render(["result"])
         ds.save()
 
+    _write_diagnostic_report(dst_path, 'classification_summary.json', {
+        'status': 'completed_with_warnings' if failed_list else 'completed',
+        'mode': 'batch',
+        'total': total,
+        'processed_count': len(output_shp_list),
+        'failed_count': len(failed_list),
+        'empty_count': len(empty_result_list),
+        'empty_results': empty_result_list,
+        'failed_results': failed_list,
+        'mask_feature_counts': feature_counts,
+        'output_shp': result_shp,
+    })
+
     # 11. 单组数据失败按告警处理，不中断整个批量工作流。
     result_msg = f'批量类别识别完成，成功处理 {len(output_shp_list)}/{total} 组数据'
+    if empty_result_list:
+        result_msg += f'，其中 {len(empty_result_list)} 组无变化区域、结果为空'
     if failed_list:
         result_msg += f'，{len(failed_list)} 组出现告警并已跳过'
     _send_completed(result_msg)
@@ -768,6 +908,16 @@ def classification_folder(pre_folder, post_folder, mask_folder, model_path, dst_
 
 def entry(pre_image, post_image, mask_shp, model_path, dst_path, path_working, output_dataset, step_id, step_name,
           kafka_server_ip_port, kafka_topic, kafka_task_id):
+    task_logger, log_path = _configure_persistent_logger('classification_task', dst_path)
+    task_logger.info('类别识别任务开始；持久化日志: %s', log_path)
+    task_logger.info(
+        '输入: pre=%s, post=%s, mask=%s, dst=%s',
+        pre_image,
+        post_image,
+        mask_shp,
+        dst_path,
+    )
+    print(f'[LOG] 类别识别日志已保存到: {log_path}', flush=True)
     init_progress_message_sender(kafka_server_ip_port, kafka_topic, kafka_task_id)
     init_progress_message_title(step_id, step_name)
     init_progress_message_source()
@@ -785,10 +935,24 @@ def entry(pre_image, post_image, mask_shp, model_path, dst_path, path_working, o
             classification(pre_image, post_image, mask_shp, model_path, dst_path, output_dataset)
     except Exception as exc:
         if _is_nonfatal_warning(exc):
+            task_logger.exception('类别识别以告警状态结束: %s', exc)
+            _write_diagnostic_report(dst_path, 'classification_warning.json', {
+                'status': 'completed_with_warning',
+                'error_type': type(exc).__name__,
+                'error': str(exc),
+                'traceback': traceback.format_exc(),
+            })
             warning_info = f'类别识别完成（存在告警）：{exc}'
             swap_write('warning', str(exc))
             _send_completed(warning_info)
             return
+        task_logger.exception('类别识别失败: %s', exc)
+        _write_diagnostic_report(dst_path, 'classification_failure.json', {
+            'status': 'failed',
+            'error_type': type(exc).__name__,
+            'error': str(exc),
+            'traceback': traceback.format_exc(),
+        })
         _send_failed(f'类别识别失败: {exc}')
         raise
     finally:

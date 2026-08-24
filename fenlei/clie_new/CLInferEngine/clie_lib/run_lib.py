@@ -26,14 +26,13 @@ import networks
 import ttach as tta_func
 from config import cfg
 from .info import info
-from .dataset import InferDataMgr
+from .dataset import InferDataMgr, reopen_infer_data_worker
 from .imageio import ImageReader, ImageWriter, ImageUtils
 from .utils import Utils
 from .tta import TTAEncoder, TTADecoder
 from .road_process import process_road
 from CLInferEngine.clie_interfaces import model_interface, model_v1_interface
 from torch.utils.data import DataLoader
-from torch.utils.data.distributed import DistributedSampler
 from torch.autograd import Variable
 from tqdm import tqdm
 import time
@@ -57,6 +56,50 @@ except:
 prg_sender = None
 
 from pathlib import Path
+
+
+def _available_cpu_count():
+    """返回容器实际可用 CPU 数，兼容 affinity 与 cgroup v1/v2。"""
+    counts = [os.cpu_count() or 1]
+    if hasattr(os, 'sched_getaffinity'):
+        try:
+            counts.append(len(os.sched_getaffinity(0)))
+        except (OSError, ValueError):
+            pass
+
+    try:
+        with open('/sys/fs/cgroup/cpu.max', 'r', encoding='ascii') as cpu_max_file:
+            quota_text, period_text = cpu_max_file.read().strip().split()[:2]
+        if quota_text != 'max':
+            quota = int(quota_text)
+            period = int(period_text)
+            if quota > 0 and period > 0:
+                counts.append(max(1, quota // period))
+    except (FileNotFoundError, OSError, ValueError):
+        try:
+            with open('/sys/fs/cgroup/cpu/cpu.cfs_quota_us', 'r', encoding='ascii') as quota_file:
+                quota = int(quota_file.read().strip())
+            with open('/sys/fs/cgroup/cpu/cpu.cfs_period_us', 'r', encoding='ascii') as period_file:
+                period = int(period_file.read().strip())
+            if quota > 0 and period > 0:
+                counts.append(max(1, quota // period))
+        except (FileNotFoundError, OSError, ValueError):
+            pass
+    return max(1, min(counts))
+
+
+def _recommended_data_workers(gpu_count):
+    """每张 GPU 默认准备 4 个切片 worker，并允许通过环境变量覆盖。"""
+    available_cpus = _available_cpu_count()
+    configured = os.environ.get('CLIE_DATA_WORKERS')
+    if configured is not None:
+        try:
+            return max(0, min(available_cpus, int(configured)))
+        except ValueError:
+            pass
+    workers_per_gpu = 4
+    target = workers_per_gpu * max(1, gpu_count)
+    return max(1, min(16, available_cpus, target))
 
 def resample_to_2m_gdal(image_path):
     image_name = os.path.basename(image_path)
@@ -353,17 +396,14 @@ def infer(kwargs):
     log_path = os.path.join('./log/', cfg.job_id + '.log')
     logger.setFilePathAndLogLevel(log_path)
     logger.setStageAndProcess("Start", '100%').info("开始")
-    cfg.TEST_BATCHES = 1
+    requested_gpu = bool(cfg.USE_GPU)
+    num_gpus = t.cuda.device_count() if requested_gpu and t.cuda.is_available() else 0
+    cfg.USE_GPU = num_gpus > 0
+    use_multi_gpu = num_gpus > 1
+    cfg.TEST_BATCHES = num_gpus if use_multi_gpu and not cfg.USE_DIST else 1
+    data_workers = _recommended_data_workers(num_gpus)
+    cfg.PIN_MEMORY = cfg.USE_GPU
 
-
-    if cfg.USE_GPU:
-        num_gpus = torch.cuda.device_count()
-        if num_gpus == 1:
-            use_multi_gpu = False
-        else:
-            use_multi_gpu = True
-            if cfg.USE_DIST == False:
-                cfg.TEST_BATCHES = cfg.TEST_BATCHES * num_gpus
     local_rank = 0
     if use_multi_gpu and cfg.USE_DIST:
         _USE_DIST = True
@@ -373,9 +413,26 @@ def infer(kwargs):
         device = t.device('cuda', local_rank)
     else:
         _USE_DIST = False
+        device = t.device('cuda', 0) if cfg.USE_GPU else t.device('cpu')
+        if cfg.USE_GPU:
+            t.cuda.set_device(0)
 
     if cfg.USE_GPU:
         t.backends.cudnn.benchmark = cfg.USE_CUDNN_BENCHMARK
+
+    if cfg.USE_GPU:
+        gpu_names = [t.cuda.get_device_name(index) for index in range(num_gpus)]
+        logger.info(
+            '分类推理设备: %s 张 GPU, batch_size=%s, data_workers=%s, devices=%s' % (
+                num_gpus, cfg.TEST_BATCHES, data_workers, gpu_names
+            )
+        )
+    else:
+        logger.warning(
+            '未检测到可用 GPU，分类将回退到 CPU；batch_size=%s, data_workers=%s' % (
+                cfg.TEST_BATCHES, data_workers
+            )
+        )
 
     rank_suffix = ''
     if _USE_DIST:
@@ -421,6 +478,9 @@ def infer(kwargs):
     except:
         cfg.IS_AGRICULTURE_INFER = False
     cfg.set_parse(kwargs)
+    if cfg.IS_AGRICULTURE_INFER:
+        # 农业模型内部把单张切片再次拆点，目前只支持 batch=1。
+        cfg.TEST_BATCHES = 1
     # color_table = Utils.generate_color_table(cfg.COLOR_TABLE_FI
     task_input = cfg.image_input_file
     test_output_root = cfg.image_output_dir
@@ -518,10 +578,14 @@ def infer(kwargs):
                 model.to(device)
                 model = t.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank)
             else:
-                model = t.nn.DataParallel(model)
-                model = model.cuda()
+                model.to(device)
+                model = t.nn.DataParallel(
+                    model,
+                    device_ids=list(range(num_gpus)),
+                    output_device=0,
+                )
         else:
-            model = model.cuda()
+            model.to(device)
     if cfg.with_tensorrt:
         from torch2trt import torch2trt
         with torch.no_grad():
@@ -631,8 +695,19 @@ def infer(kwargs):
                     f.write('[WARNING] ' + time.strftime('[%y%m%d_%H:%M:%S]') + '  Skip predicting ' + filename)
             continue
 
-        test_dataloader = DataLoader(test_data, cfg.TEST_BATCHES, shuffle=False, num_workers=0,
-                                     pin_memory=cfg.PIN_MEMORY)
+        dataloader_kwargs = {
+            'batch_size': cfg.TEST_BATCHES,
+            'shuffle': False,
+            'num_workers': data_workers,
+            'pin_memory': cfg.PIN_MEMORY,
+        }
+        if data_workers > 0:
+            dataloader_kwargs.update({
+                'prefetch_factor': 1,
+                'persistent_workers': True,
+                'worker_init_fn': reopen_infer_data_worker,
+            })
+        test_dataloader = DataLoader(test_data, **dataloader_kwargs)
 
         message_dict = {'progress': _sub_task_prg_min, 'runningStatus': 'running', 'runningInfo': '构建文件写出指针'}
         prg_sender.send(message_dict)

@@ -13,7 +13,8 @@ class CostVolumeLayer(nn.Module):
     def forward(self, x1, x2):
 
         shape = list(x1.size()); shape[1] = (self.search_range * 2 + 1) ** 2
-        cv = torch.zeros(shape).cuda()
+        # 跟随当前 DataParallel replica 的输入设备，不能硬编码到 cuda:0。
+        cv = x1.new_zeros(shape)
 
         for i in range(-self.search_range, self.search_range + 1):
             for j in range(-self.search_range, self.search_range + 1):

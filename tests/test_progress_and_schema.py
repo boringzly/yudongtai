@@ -6,6 +6,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -404,7 +405,7 @@ class EntryProgressTests(unittest.TestCase):
             ROOT / "change" / "test_lib_batch_memeff_single_image_nomp.py"
         ).read_text(encoding="utf-8")
         self.assertIn("'TEST_IMG_SIZE': 1280", source)
-        self.assertIn("'TEST_BATCHES': 1", source)
+        self.assertIn("'TEST_BATCHES': max(1, gpu_count)", source)
         self.assertIn("'TEST_PREFETCH_FACTOR': 1", source)
 
     def test_classification_temp_dirs_are_cleaned_on_entry_exit(self):
@@ -462,6 +463,186 @@ class PreviewTests(unittest.TestCase):
         self.assertNotIn("temp_preview_root", source)
         self.assertIn("_last_subprocess_progress_key", source)
         self.assertIn("message_dict['runningStatus'] = 'running'", source)
+
+
+class MultiGpuInferenceTests(unittest.TestCase):
+    def test_change_detection_uses_single_writer_data_parallel(self):
+        source = (
+            ROOT / "change" / "test_lib_batch_memeff_single_image_nomp.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("torch.cuda.device_count() if torch.cuda.is_available() else 0", source)
+        self.assertIn("'TEST_BATCHES': max(1, gpu_count)", source)
+        self.assertIn("net = torch.nn.DataParallel(", source)
+        self.assertIn("device_ids=list(range(gpu_count))", source)
+        self.assertNotIn("mp.spawn(test_lib", source)
+
+    def test_change_detection_progress_and_indexes_are_batch_safe(self):
+        source = (
+            ROOT / "change" / "test_lib_batch_memeff_single_image_nomp.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("total_patches = len(test_data)", source)
+        self.assertIn("processed_patches += batch_patches", source)
+        self.assertIn("valid_nodata_mask = nodata_mask[non_zero_mask]", source)
+        self.assertIn("valid_indexs = [component[non_zero_mask] for component in indexs]", source)
+
+    def test_change_detection_scales_to_48_workers_for_60_cpu(self):
+        source_path = ROOT / "change" / "test_lib_batch_memeff_single_image_nomp.py"
+        tree = ast.parse(source_path.read_text(encoding="utf-8"))
+        worker_function = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_recommended_dataloader_workers"
+        )
+        namespace = {"_available_cpu_count": lambda: 60}
+        exec(
+            compile(ast.Module(body=[worker_function], type_ignores=[]), str(source_path), "exec"),
+            namespace,
+        )
+        self.assertEqual(namespace["_recommended_dataloader_workers"](), 48)
+
+    def test_classification_handles_zero_one_and_multiple_visible_gpus(self):
+        source = (
+            ROOT / "fenlei" / "clie_new" / "CLInferEngine" / "clie_lib" / "run_lib.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("cfg.USE_GPU = num_gpus > 0", source)
+        self.assertIn("use_multi_gpu = num_gpus > 1", source)
+        self.assertIn("cfg.TEST_BATCHES = num_gpus if use_multi_gpu", source)
+        self.assertIn("model = t.nn.DataParallel(", source)
+        self.assertIn("device_ids=list(range(num_gpus))", source)
+        self.assertIn("device = t.device('cuda', 0) if cfg.USE_GPU else t.device('cpu')", source)
+
+        cost_volume_source = (
+            ROOT / "fenlei" / "clie_new" / "networks" / "utils" / "CostVolume.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("cv = x1.new_zeros(shape)", cost_volume_source)
+        self.assertNotIn("cv = torch.zeros(shape).cuda()", cost_volume_source)
+
+    def test_classification_worker_count_and_gdal_handles_are_parallel_safe(self):
+        run_path = ROOT / "fenlei" / "clie_new" / "CLInferEngine" / "clie_lib" / "run_lib.py"
+        tree = ast.parse(run_path.read_text(encoding="utf-8"))
+        worker_function = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_recommended_data_workers"
+        )
+        namespace = {"_available_cpu_count": lambda: 60, "os": os}
+        exec(
+            compile(ast.Module(body=[worker_function], type_ignores=[]), str(run_path), "exec"),
+            namespace,
+        )
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CLIE_DATA_WORKERS", None)
+            self.assertEqual(namespace["_recommended_data_workers"](2), 8)
+        with mock.patch.dict(os.environ, {"CLIE_DATA_WORKERS": "0"}):
+            self.assertEqual(namespace["_recommended_data_workers"](2), 0)
+
+        dataset_source = (
+            ROOT / "fenlei" / "clie_new" / "CLInferEngine" / "clie_lib" / "dataset.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("def reopen_readers(self):", dataset_source)
+        self.assertIn("worker_info.dataset.reopen_readers()", dataset_source)
+        self.assertIn("'worker_init_fn': reopen_infer_data_worker", run_path.read_text(encoding="utf-8"))
+
+
+class PersistentDiagnosticsTests(unittest.TestCase):
+    @staticmethod
+    def _load_functions(source_path, function_names, namespace):
+        tree = ast.parse(source_path.read_text(encoding="utf-8"))
+        functions = [
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name in function_names
+        ]
+        exec(
+            compile(ast.Module(body=functions, type_ignores=[]), str(source_path), "exec"),
+            namespace,
+        )
+        return namespace
+
+    def test_logs_are_persisted_above_working_directory(self):
+        source_path = ROOT / "change" / "change_detection_core.py"
+        namespace = {"os": os, "Path": Path, "logging": __import__("logging")}
+        self._load_functions(
+            source_path,
+            {"_ensure_log_dir", "_configure_persistent_logger"},
+            namespace,
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            task_root = Path(temp_dir) / "task-1"
+            dst_path = task_root / "working" / "change_detection" / "shp"
+            logger, log_path = namespace["_configure_persistent_logger"](
+                "persistent_diagnostics_test",
+                dst_path,
+            )
+            logger.error("diagnostic-line")
+            for handler in logger.handlers:
+                handler.flush()
+            self.assertEqual(Path(log_path).parent, task_root / "logs")
+            self.assertIn("diagnostic-line", Path(log_path).read_text(encoding="utf-8"))
+            for handler in list(logger.handlers):
+                logger.removeHandler(handler)
+                handler.close()
+
+    def test_classification_subprocess_output_is_captured(self):
+        source_path = ROOT / "fenlei" / "classification_core.py"
+        namespace = {
+            "os": os,
+            "Path": Path,
+            "logging": __import__("logging"),
+            "subprocess": __import__("subprocess"),
+        }
+        self._load_functions(
+            source_path,
+            {"_ensure_log_dir", "_configure_persistent_logger", "_run_subprocess_logged"},
+            namespace,
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            logger, log_path = namespace["_configure_persistent_logger"](
+                "classification_subprocess_test",
+                temp_dir,
+            )
+            namespace["_run_subprocess_logged"](
+                [sys.executable, "-c", "print('child-diagnostic')"],
+                cwd=temp_dir,
+                env=os.environ.copy(),
+                logger=logger,
+            )
+            for handler in logger.handlers:
+                handler.flush()
+            self.assertIn("child-diagnostic", Path(log_path).read_text(encoding="utf-8"))
+            for handler in list(logger.handlers):
+                logger.removeHandler(handler)
+                handler.close()
+
+    def test_empty_results_and_failures_have_separate_diagnostics(self):
+        change_source = (ROOT / "change" / "change_detection_core.py").read_text(encoding="utf-8")
+        classification_source = (ROOT / "fenlei" / "classification_core.py").read_text(encoding="utf-8")
+        for source in (change_source, classification_source):
+            self.assertIn("empty_result_list", source)
+            self.assertIn("logger.exception", source)
+            self.assertIn("_failure.json", source)
+            self.assertIn("_summary.json", source)
+        self.assertIn("stdout=subprocess.PIPE", classification_source)
+        self.assertNotIn("subprocess.run([", classification_source)
+
+    def test_workflow_model_paths_are_used_with_legacy_fallback(self):
+        source_path = ROOT / "fenlei" / "classification_core.py"
+        namespace = {"Path": Path, "FileNotFoundError": FileNotFoundError}
+        self._load_functions(source_path, {"_resolve_classification_model"}, namespace)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            work_dir = Path(temp_dir) / "clie_new"
+            tools_dir = work_dir / "tools"
+            tools_dir.mkdir(parents=True)
+            fallback_model = tools_dir / "fullclass_chinaall_3b.pth"
+            fallback_model.write_bytes(b"fallback")
+            explicit_model = Path(temp_dir) / "custom.pth"
+            explicit_model.write_bytes(b"custom")
+            resolve_model = namespace["_resolve_classification_model"]
+            self.assertEqual(resolve_model(explicit_model, work_dir), str(explicit_model.resolve()))
+            self.assertEqual(resolve_model("missing.pth", work_dir), str(fallback_model.resolve()))
+
+        change_source = (
+            ROOT / "change" / "test_lib_batch_memeff_single_image_nomp.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("'TEST_CKPT': str(checkpoint_path)", change_source)
+        self.assertIn("model_path=model_path", (ROOT / "change" / "change_detection_core.py").read_text(encoding="utf-8"))
 
 
 class BigTiffWriterTests(unittest.TestCase):

@@ -4,6 +4,7 @@ import time
 from tqdm import tqdm
 import torch
 from torch.utils import data
+from torch.utils.data import get_worker_info
 from torchvision import transforms as T
 from .imageio import ImageReader
 import cv2
@@ -42,14 +43,17 @@ class InferDataMgr(data.Dataset):
             self.image_reader = None
             return
         self.mask_reader = None
+        self.mask_filename = None
         try:
             base_name, ext = os.path.splitext(filename)
             file_name = os.path.basename(base_name)
             maskname = f"./tmp/mask/{file_name}_mask{ext}"
+            self.mask_filename = maskname
             self.mask_reader = ImageReader(maskname)
         except Exception:
             pass
         self.image_reader.set_band_list(band_list)
+        self.requested_band_list = list(band_list)
         self.width = width
         self.height = height
         self.upsample = upsample
@@ -96,6 +100,39 @@ class InferDataMgr(data.Dataset):
                         j == width_crop_num and width_pad_up == pixel_overlap_half):
                     continue
                 self.index_list.append((i, j))
+
+    def reopen_readers(self):
+        """为 DataLoader worker 重新打开独立 GDAL 句柄，避免跨进程共享句柄。"""
+        try:
+            if self.image_reader is not None:
+                self.image_reader.close()
+        except Exception:
+            pass
+        self.image_reader = ImageReader(self.filename)
+        self.image_reader.set_band_list(self.requested_band_list)
+
+        try:
+            if self.mask_reader is not None:
+                self.mask_reader.close()
+        except Exception:
+            pass
+        self.mask_reader = None
+        if self.mask_filename:
+            try:
+                self.mask_reader = ImageReader(self.mask_filename)
+            except Exception:
+                self.mask_reader = None
+
+    def __getstate__(self):
+        """spawn 模式不序列化 GDAL dataset，由 worker 自行重新打开。"""
+        state = self.__dict__.copy()
+        state['image_reader'] = None
+        state['mask_reader'] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self.reopen_readers()
 
     def __getitem__(self, index):
         idx_i, idx_j = self.index_list[index]
@@ -200,3 +237,12 @@ class InferDataMgr(data.Dataset):
 
     def __len__(self):
         return len(self.index_list)
+
+
+def reopen_infer_data_worker(_worker_id):
+    """DataLoader worker 初始化入口；Linux fork 下也强制使用独立 GDAL 句柄。"""
+    torch.set_num_threads(1)
+    cv2.setNumThreads(0)
+    worker_info = get_worker_info()
+    if worker_info is not None and hasattr(worker_info.dataset, 'reopen_readers'):
+        worker_info.dataset.reopen_readers()

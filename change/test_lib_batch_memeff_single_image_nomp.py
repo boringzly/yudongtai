@@ -14,7 +14,6 @@ import torch
 from torch.autograd import Variable as V
 from torch.utils import data
 from torchvision import transforms as T
-import torch.multiprocessing as mp
 from shapely.geometry import Polygon
 from shapely.ops import transform as shapely_transform
 import pyproj
@@ -23,7 +22,6 @@ from tqdm import tqdm
 from networks.GenerateNet import GenerateNet
 from utils.hist_stretch import percent_stretch_image
 from config import cfg
-from multiprocessing import Pool, cpu_count, get_context
 from functools import partial
 
 import warnings
@@ -69,9 +67,9 @@ def _available_cpu_count():
 
 
 def _recommended_dataloader_workers():
-    """使用约 80% 的容器 CPU，最多 24 个进程，避免内存和共享存储压力过大。"""
+    """使用约 80% 的容器 CPU，最多 48 个进程，给主进程和 GDAL 留出余量。"""
     available_cpus = _available_cpu_count()
-    return max(1, min(24, int(available_cpus * 0.8)))
+    return max(1, min(48, int(available_cpus * 0.8)))
 
 def CalHistogram(img):
     
@@ -757,7 +755,7 @@ def build_overviews(dataset, overviewlist=[2,4,8,16,32,64,128]):
 
 
 def test_lib_big_memeff(pre_img_path='', post_img_path='', output_path='', logger=None, callback_url=None, job_id=None,
-                        temp_dir_suffix="tmp", progress_callback=None):
+                        temp_dir_suffix="tmp", progress_callback=None, model_path=None):
     """
     主要的推理函数
 
@@ -803,22 +801,38 @@ def test_lib_big_memeff(pre_img_path='', post_img_path='', output_path='', logge
     if logger is not None:
         logger.info("两幅图像有空间交集，开始构建模型------")
     
+    module_dir = Path(__file__).resolve().parent
+    checkpoint_candidates = []
+    if model_path:
+        requested_checkpoint = Path(model_path)
+        checkpoint_candidates.append(requested_checkpoint)
+        if not requested_checkpoint.is_absolute():
+            checkpoint_candidates.append(module_dir / requested_checkpoint)
+    checkpoint_candidates.append(module_dir / 'FBCD_test_select0207_best_acc.pth')
+    checkpoint_path = next((path.resolve() for path in checkpoint_candidates if path.is_file()), None)
+    if checkpoint_path is None:
+        searched_paths = ', '.join(str(path) for path in checkpoint_candidates)
+        raise FileNotFoundError(f'变化检测模型不存在，已检查: {searched_paths}')
+    if logger is not None:
+        logger.info('变化检测模型: %s', checkpoint_path)
+
+    gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
     kwargs = {
         'PRE_IMG_PATH': pre_img_path,
         'POST_IMG_PATH': post_img_path,
         'TEST_OUT_PATH': output_path,
         'IMG_SUFFIX': '.tif',
         'GT_SUFFIX': '.tif',
-        'TEST_CKPT': './FBCD_test_select0207_best_acc.pth',
-        'MEAN_FILE': './mean_value.txt',
-        'STD_FILE': './std_value.txt',
+        'TEST_CKPT': str(checkpoint_path),
+        'MEAN_FILE': str(module_dir / 'mean_value.txt'),
+        'STD_FILE': str(module_dir / 'std_value.txt'),
         'MODEL_NAME': 'FBCD',
         'MODEL_BACKBONE': 'vssm_tiny',
         'MODEL_NUM_CLASSES': 1,
-        # FFT 预处理在 CPU 上执行。使用小 batch 可以让单个切片准备好后立即送入 GPU，
-        # 避免等待 4 个 2560x2560 切片全部完成后 GPU 才开始工作。
-        'TEST_BATCHES': 1,
-        # 根据 Pod 的 CPU 配额自动使用约 80%：16 CPU -> 12，30 CPU -> 24。
+        # 单进程 DataParallel 按 batch 维度分发：双卡 batch=2，单卡/CPU batch=1。
+        # 写出仍只在主进程进行，避免多个 GPU 进程并发写同一个 TIFF。
+        'TEST_BATCHES': max(1, gpu_count),
+        # 根据 Pod 的 CPU 配额自动使用约 80%：16 CPU -> 12，60 CPU -> 48。
         # 其余 CPU 留给主进程、GPU 喂数、GDAL 写出和消息线程。
         'TEST_NUM_WORKERS': _recommended_dataloader_workers(),
         'TEST_PREFETCH_FACTOR': 1,
@@ -835,17 +849,11 @@ def test_lib_big_memeff(pre_img_path='', post_img_path='', output_path='', logge
     }
     #import pdb;pdb.set_trace()
     cfg.set_parse(kwargs)
-    # nrank = torch.cuda.device_count()
-    nrank = 1
     if logger is not None:
         logger.info("开始推理过程------")
-    
-    if nrank > 1:
-        mp.set_sharing_strategy('file_system')
-        mp.spawn(test_lib, (torch.cuda.device_count(), cfg), torch.cuda.device_count())
-    else:
-        #test_lib(0, torch.cuda.device_count(), cfg, logger)  # use cpu when nrank is 0
-        test_lib(0, 1, cfg, logger, progress_callback=progress_callback)
+
+    # 多卡使用单进程 DataParallel。GDAL 输出只由该进程写入，避免 DDP 多进程争写。
+    test_lib(0, gpu_count, cfg, logger, progress_callback=progress_callback)
 
     # 修改临时目录清理逻辑，使用指定的后缀
     temp_dir_path = Path(os.path.join(cfg.TEST_OUT_PATH, temp_dir_suffix))
@@ -872,23 +880,26 @@ def generate_namelist_from_file(name_list_file, file_root,  suffix):
     return name_list
 
 
-def test_lib(local_rank, nrank, cfg, logger, progress_callback=None):
+def test_lib(local_rank, gpu_count, cfg, logger, progress_callback=None):
     if logger is not None:
         logger.info('test_lib_begin')
-    if nrank > 1:
-        os.environ["MASTER_ADDR"] = 'localhost'
-        # now = datetime.now()
-        # port = 50001+ now.microsecond % 9999
-        os.environ["MASTER_PORT"] = str(cfg.PORT)
-        torch.distributed.init_process_group(backend='nccl', world_size=nrank, rank=local_rank)
-        device = torch.device('cuda', local_rank)
-    elif nrank == 1:
-        torch.cuda.set_device(local_rank)
-        device = torch.device('cuda', local_rank)
-        #torch.cuda.set_device(0)
-        #device = torch.device('cuda', 0)
+    if gpu_count > 0:
+        torch.cuda.set_device(0)
+        device = torch.device('cuda', 0)
     else:
         device = torch.device('cpu')
+
+    if logger is not None:
+        if gpu_count > 0:
+            gpu_names = [torch.cuda.get_device_name(index) for index in range(gpu_count)]
+            logger.info(
+                '变化检测推理设备: %s 张 GPU, batch_size=%s, devices=%s',
+                gpu_count,
+                cfg.TEST_BATCHES,
+                gpu_names,
+            )
+        else:
+            logger.warning('未检测到可用 GPU，变化检测将回退到 CPU')
 
     print('rank {} is ready!'.format(local_rank))
 
@@ -934,10 +945,12 @@ def test_lib(local_rank, nrank, cfg, logger, progress_callback=None):
         module_model_state_dict[item] = value
     net.load_state_dict(module_model_state_dict, strict=True)
     net.to(device)
-    if nrank > 1:
-        net = torch.nn.parallel.DistributedDataParallel(net, device_ids=[local_rank], output_device=local_rank)
-    # elif nrank == 1:
-    #     net = torch.nn.DataParallel(net)
+    if gpu_count > 1:
+        net = torch.nn.DataParallel(
+            net,
+            device_ids=list(range(gpu_count)),
+            output_device=0,
+        )
     net.eval()
 
     # inference loop
@@ -1096,8 +1109,9 @@ def test_lib(local_rank, nrank, cfg, logger, progress_callback=None):
             batch_size=cfg.TEST_BATCHES,
             shuffle=False,
             num_workers=cfg.TEST_NUM_WORKERS,
-            pin_memory=True,
+            pin_memory=gpu_count > 0,
             prefetch_factor=cfg.TEST_PREFETCH_FACTOR,
+            persistent_workers=cfg.TEST_NUM_WORKERS > 0,
         )
         # create result file
 
@@ -1115,21 +1129,29 @@ def test_lib(local_rank, nrank, cfg, logger, progress_callback=None):
         set_color_table(out_data, [(0, 0, 0), (255, 255, 255)])
         set_no_data_value(out_data, 0)
         # start prediction
+        total_patches = len(test_data)
+        processed_patches = 0
         if local_rank == 0:
-            pbar = tqdm(desc=basenmae[n], total=len(data_loader_test))
+            pbar = tqdm(desc=basenmae[n], total=total_patches)
 
         # cur_batch = 0
         # pre_img, post_img, nodata_mask, indexs = None, None, None, None
 
         for idx, (pre_img, post_img, nodata_mask, indexs) in enumerate(data_loader_test):
+            batch_patches = int(nodata_mask.size(0))
             # 跳过无效数据
             non_zero_mask = nodata_mask.view(nodata_mask.size(0), -1).abs().sum(dim=1) != 0
             if non_zero_mask.sum() == 0:
+                processed_patches += batch_patches
                 if local_rank == 0:
-                    pbar.update()
+                    pbar.update(batch_patches)
+                    if progress_callback is not None and total_patches > 0:
+                        progress_callback(processed_patches, total_patches)
                 continue
             pre_img = pre_img[non_zero_mask]
             post_img = post_img[non_zero_mask]
+            valid_nodata_mask = nodata_mask[non_zero_mask]
+            valid_indexs = [component[non_zero_mask] for component in indexs]
 
             img = np.concatenate((pre_img, post_img), 1)
             if cfg.WITH_TTA:
@@ -1144,8 +1166,13 @@ def test_lib(local_rank, nrank, cfg, logger, progress_callback=None):
                 output = test_normal(net, img, cfg.MODEL_NUM_CLASSES, device)  # (b,h,w)
             for i in range(output.shape[0]):
                 # maskout nodata area
-                pred = output[i] * nodata_mask[i].numpy().astype(output[i].dtype)
-                clip_x, clip_y, pad_x, pad_y = indexs[0][i], indexs[1][i], indexs[2][i], indexs[3][i]
+                pred = output[i] * valid_nodata_mask[i].numpy().astype(output[i].dtype)
+                clip_x, clip_y, pad_x, pad_y = (
+                    valid_indexs[0][i],
+                    valid_indexs[1][i],
+                    valid_indexs[2][i],
+                    valid_indexs[3][i],
+                )
                 overlap_half = cfg.TEST_PIXEL_OVERLAP // 2
                 if pad_x == -1:
                     pred = pred[:, overlap_half:]
@@ -1173,12 +1200,12 @@ def test_lib(local_rank, nrank, cfg, logger, progress_callback=None):
                         or gdal.GetLastErrorType() >= gdal.CE_Failure):
                     error_message = gdal.GetLastErrorMsg() or 'unknown GDAL error'
                     raise RuntimeError(f'写入变化检测 BigTIFF 失败: {error_message}')
+            processed_patches += batch_patches
             if local_rank == 0:
-                pbar.update()
-                total_batches = len(data_loader_test)
-                if progress_callback is not None and total_batches > 0:
-                    # 每个 batch 写入并刷新后汇报，供前端显示 TIFF 大小和动态 ETA。
-                    progress_callback(idx + 1, total_batches)
+                pbar.update(batch_patches)
+                if progress_callback is not None and total_patches > 0:
+                    # 按真实切片数汇报；多卡 batch>1 时进度与 ETA 仍保持准确。
+                    progress_callback(processed_patches, total_patches)
         build_overviews(out_data)
         del test_data.predataset
         del test_data.postdataset
