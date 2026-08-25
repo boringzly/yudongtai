@@ -89,6 +89,20 @@ class NonFatalTaskWarning(RuntimeError):
     """记录告警但不让当前工作流步骤以失败状态退出。"""
 
 
+def _coerce_bool(value):
+    """将工作流可能传入的布尔值或字符串统一转换为 bool。"""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    normalized = str(value).strip().lower()
+    if normalized in {'1', 'true', 'yes', 'y', 'on'}:
+        return True
+    if normalized in {'0', 'false', 'no', 'n', 'off', ''}:
+        return False
+    raise ValueError(f'无法解析 use_two_models: {value}')
+
+
 def _is_nonfatal_warning(exc):
     if isinstance(exc, NonFatalTaskWarning):
         return True
@@ -291,7 +305,8 @@ from DatasetBuilder import DatasetBuilder
 
 # ========== 算法主体 ==========
 
-def change_detection(pre_image, post_image, model_path, dst_path, output_dataset):
+def change_detection(pre_image, post_image, model_path, dst_path, output_dataset,
+                     use_two_models=False, second_model_path=None):
     global prg_sender
 
     # 1. 报告启动
@@ -338,6 +353,8 @@ def change_detection(pre_image, post_image, model_path, dst_path, output_dataset
         temp_dir_suffix="tmp",
         progress_callback=_cd_progress,
         model_path=model_path,
+        use_two_models=use_two_models,
+        second_model_path=second_model_path,
     )
 
     # 6. 检查结果是否生成。缺少产物记为告警，由入口返回 completed，避免中断工作流。
@@ -370,6 +387,7 @@ def change_detection(pre_image, post_image, model_path, dst_path, output_dataset
         'output_shp': output_shp,
         'feature_count': feature_count,
         'empty_result': feature_count == 0,
+        'model_mode': 'dual' if use_two_models else 'single',
     })
 
     # 9. 报告完成
@@ -377,7 +395,8 @@ def change_detection(pre_image, post_image, model_path, dst_path, output_dataset
 
 # ========== 批量变化检测（文件夹模式）==========
 
-def change_detection_folder(pre_folder, post_folder, model_path, dst_path, output_dataset):
+def change_detection_folder(pre_folder, post_folder, model_path, dst_path, output_dataset,
+                            use_two_models=False, second_model_path=None):
     """批量变化检测：遍历前时相文件夹中所有影像文件，在后时相文件夹中匹配同名文件进行变化检测"""
     global prg_sender
 
@@ -547,6 +566,8 @@ def change_detection_folder(pre_folder, post_folder, model_path, dst_path, outpu
                     inference_started_at,
                 ),
                 model_path=model_path,
+                use_two_models=use_two_models,
+                second_model_path=second_model_path,
             )
             if not os.path.exists(run_output_shp):
                 raise NonFatalTaskWarning(f'变化检测未生成结果文件: {run_output_shp}')
@@ -629,6 +650,7 @@ def change_detection_folder(pre_folder, post_folder, model_path, dst_path, outpu
         'failed_results': failed_list,
         'feature_counts': feature_counts,
         'output_shp_dir': shp_dir,
+        'model_mode': 'dual' if use_two_models else 'single',
     })
 
     prg_sender.send({'progress': 99, 'runningStatus': 'running', 'runningInfo': '变化检测结果已生成，等待步骤完成'})
@@ -645,10 +667,18 @@ def change_detection_folder(pre_folder, post_folder, model_path, dst_path, outpu
 # ========== 入口函数 ==========
 
 def entry(pre_image, post_image, model_path, dst_path, output_dataset, step_id, step_name,
-          kafka_server_ip_port, kafka_topic, kafka_task_id):
+          kafka_server_ip_port, kafka_topic, kafka_task_id, use_two_models=False,
+          second_model_path=None):
+    use_two_models = _coerce_bool(use_two_models)
     task_logger, log_path = _configure_persistent_logger('change_task', dst_path)
     task_logger.info('变化检测任务开始；持久化日志: %s', log_path)
     task_logger.info('输入: pre=%s, post=%s, dst=%s', pre_image, post_image, dst_path)
+    task_logger.info(
+        '模型模式: %s；主模型=%s；第二模型=%s',
+        '双模型 OR 融合' if use_two_models else '单模型',
+        model_path,
+        second_model_path if use_two_models else '未启用',
+    )
     print(f'[LOG] 变化检测日志已保存到: {log_path}', flush=True)
     init_progress_message_sender(kafka_server_ip_port, kafka_topic, kafka_task_id)
     init_progress_message_title(step_id, step_name)
@@ -662,9 +692,25 @@ def entry(pre_image, post_image, model_path, dst_path, output_dataset, step_id, 
     try:
         # 自动检测：如果输入为文件夹（目录），则进入批量处理模式
         if os.path.isdir(pre_image) and os.path.isdir(post_image):
-            change_detection_folder(pre_image, post_image, model_path, dst_path, output_dataset)
+            change_detection_folder(
+                pre_image,
+                post_image,
+                model_path,
+                dst_path,
+                output_dataset,
+                use_two_models=use_two_models,
+                second_model_path=second_model_path,
+            )
         else:
-            change_detection(pre_image, post_image, model_path, dst_path, output_dataset)
+            change_detection(
+                pre_image,
+                post_image,
+                model_path,
+                dst_path,
+                output_dataset,
+                use_two_models=use_two_models,
+                second_model_path=second_model_path,
+            )
     except Exception as exc:
         if _is_nonfatal_warning(exc):
             task_logger.exception('变化检测以告警状态结束: %s', exc)

@@ -754,8 +754,25 @@ def build_overviews(dataset, overviewlist=[2,4,8,16,32,64,128]):
         raise RuntimeError(f'完成变化检测 BigTIFF 写盘失败: {error_message}')
 
 
+def _resolve_checkpoint_path(module_dir, requested_path, fallback_filename, model_label):
+    """优先使用工作流传入路径，相对路径同时按模块目录解析。"""
+    candidates = []
+    if requested_path:
+        requested_checkpoint = Path(requested_path)
+        candidates.append(requested_checkpoint)
+        if not requested_checkpoint.is_absolute():
+            candidates.append(module_dir / requested_checkpoint)
+    candidates.append(module_dir / fallback_filename)
+    checkpoint_path = next((path.resolve() for path in candidates if path.is_file()), None)
+    if checkpoint_path is None:
+        searched_paths = ', '.join(str(path) for path in candidates)
+        raise FileNotFoundError(f'{model_label}不存在，已检查: {searched_paths}')
+    return checkpoint_path
+
+
 def test_lib_big_memeff(pre_img_path='', post_img_path='', output_path='', logger=None, callback_url=None, job_id=None,
-                        temp_dir_suffix="tmp", progress_callback=None, model_path=None):
+                        temp_dir_suffix="tmp", progress_callback=None, model_path=None,
+                        use_two_models=False, second_model_path=None):
     """
     主要的推理函数
 
@@ -802,19 +819,39 @@ def test_lib_big_memeff(pre_img_path='', post_img_path='', output_path='', logge
         logger.info("两幅图像有空间交集，开始构建模型------")
     
     module_dir = Path(__file__).resolve().parent
-    checkpoint_candidates = []
-    if model_path:
-        requested_checkpoint = Path(model_path)
-        checkpoint_candidates.append(requested_checkpoint)
-        if not requested_checkpoint.is_absolute():
-            checkpoint_candidates.append(module_dir / requested_checkpoint)
-    checkpoint_candidates.append(module_dir / 'FBCD_test_select0207_best_acc.pth')
-    checkpoint_path = next((path.resolve() for path in checkpoint_candidates if path.is_file()), None)
-    if checkpoint_path is None:
-        searched_paths = ', '.join(str(path) for path in checkpoint_candidates)
-        raise FileNotFoundError(f'变化检测模型不存在，已检查: {searched_paths}')
+    use_two_models = (
+        use_two_models
+        if isinstance(use_two_models, bool)
+        else str(use_two_models).strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
+    )
+    checkpoint_path = _resolve_checkpoint_path(
+        module_dir,
+        model_path,
+        (
+            'FBCD_test_Levir_CD_best_acc.pth'
+            if use_two_models
+            else 'FBCD_test_select0207_best_acc.pth'
+        ),
+        '变化检测主模型',
+    )
+    second_checkpoint_path = None
+    if use_two_models:
+        second_checkpoint_path = _resolve_checkpoint_path(
+            module_dir,
+            second_model_path,
+            'FBCD_test_select0207_best_acc.pth',
+            '变化检测第二模型',
+        )
+        if second_checkpoint_path == checkpoint_path:
+            raise ValueError(
+                f'双模型模式需要两个不同的权重文件，当前都解析为: {checkpoint_path}'
+            )
     if logger is not None:
-        logger.info('变化检测模型: %s', checkpoint_path)
+        logger.info('变化检测主模型: %s', checkpoint_path)
+        if use_two_models:
+            logger.info('变化检测第二模型: %s；融合方式: OR', second_checkpoint_path)
+        else:
+            logger.info('变化检测使用单模型模式')
 
     gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
     kwargs = {
@@ -824,6 +861,8 @@ def test_lib_big_memeff(pre_img_path='', post_img_path='', output_path='', logge
         'IMG_SUFFIX': '.tif',
         'GT_SUFFIX': '.tif',
         'TEST_CKPT': str(checkpoint_path),
+        'USE_TWO_MODELS': use_two_models,
+        'TEST_CKPT_2': str(second_checkpoint_path) if second_checkpoint_path else None,
         'MEAN_FILE': str(module_dir / 'mean_value.txt'),
         'STD_FILE': str(module_dir / 'std_value.txt'),
         'MODEL_NAME': 'FBCD',
@@ -880,6 +919,26 @@ def generate_namelist_from_file(name_list_file, file_root,  suffix):
     return name_list
 
 
+def _load_change_model(checkpoint_path, cfg, device, gpu_count):
+    net = GenerateNet(cfg)
+    pretrained_dict = torch.load(checkpoint_path, map_location='cpu')
+    module_model_state_dict = {}
+    for item, value in pretrained_dict['model_state_dict'].items():
+        if item.startswith('module.'):
+            item = item[7:]
+        module_model_state_dict[item] = value
+    net.load_state_dict(module_model_state_dict, strict=True)
+    net.to(device)
+    if gpu_count > 1:
+        net = torch.nn.DataParallel(
+            net,
+            device_ids=list(range(gpu_count)),
+            output_device=0,
+        )
+    net.eval()
+    return net
+
+
 def test_lib(local_rank, gpu_count, cfg, logger, progress_callback=None):
     if logger is not None:
         logger.info('test_lib_begin')
@@ -934,24 +993,13 @@ def test_lib(local_rank, gpu_count, cfg, logger, progress_callback=None):
             if logger is not None:
                 logger.info(f"创建临时目录: {temp_dir_path}")
 
-    # network
-    net = GenerateNet(cfg)
-    pretrained_dict = torch.load(cfg.TEST_CKPT, map_location='cpu')
-    module_model_state_dict = dict()
-
-    for item, value in pretrained_dict['model_state_dict'].items():
-        if item.startswith('module.'):
-            item = item[7:]
-        module_model_state_dict[item] = value
-    net.load_state_dict(module_model_state_dict, strict=True)
-    net.to(device)
-    if gpu_count > 1:
-        net = torch.nn.DataParallel(
-            net,
-            device_ids=list(range(gpu_count)),
-            output_device=0,
-        )
-    net.eval()
+    # 默认只加载主模型；双模型开关打开时才额外占用显存加载第二模型。
+    net = _load_change_model(cfg.TEST_CKPT, cfg, device, gpu_count)
+    net2 = None
+    if getattr(cfg, 'USE_TWO_MODELS', False):
+        net2 = _load_change_model(cfg.TEST_CKPT_2, cfg, device, gpu_count)
+        if logger is not None:
+            logger.info('两个变化检测模型均已加载，推理结果将执行 OR 融合')
 
     # inference loop
     for n in range(len(pre_namelist)):
@@ -1162,8 +1210,14 @@ def test_lib(local_rank, gpu_count, cfg, logger, progress_callback=None):
                 img4 = np.ascontiguousarray(np.array(img2)[:, :, :, ::-1], dtype=np.float32)
                 images = np.ascontiguousarray(np.concatenate([img1, img2, img3, img4]), dtype=np.float32)
                 output = test_with_TTA(net, images, cfg.MODEL_NUM_CLASSES, device)
+                if net2 is not None:
+                    output2 = test_with_TTA(net2, images, cfg.MODEL_NUM_CLASSES, device)
             else:
                 output = test_normal(net, img, cfg.MODEL_NUM_CLASSES, device)  # (b,h,w)
+                if net2 is not None:
+                    output2 = test_normal(net2, img, cfg.MODEL_NUM_CLASSES, device)
+            if net2 is not None:
+                output = np.bitwise_or(output, output2)
             for i in range(output.shape[0]):
                 # maskout nodata area
                 pred = output[i] * valid_nodata_mask[i].numpy().astype(output[i].dtype)

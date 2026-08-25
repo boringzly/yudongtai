@@ -28,6 +28,20 @@ parameters:
     default: "./FBCD_test_Levir_CD_best_acc.pth"
     position: "input"
 
+  - id: "use_two_models"
+    name: "是否使用双模型融合"
+    type: "bool"
+    required: false
+    default: false
+    position: "input"
+
+  - id: "second_model_path"
+    name: "第二模型权重路径"
+    type: "str"
+    required: false
+    default: "./FBCD_test_select0207_best_acc.pth"
+    position: "input"
+
   - id: "dst_path"
     name: "输出目录路径"
     type: "str"

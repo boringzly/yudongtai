@@ -20,6 +20,11 @@
             "post_image": {
                 "name": "后时相影像路径",
                 "type": "str"
+            },
+            "use_two_models": {
+                "name": "是否使用双模型融合",
+                "type": "bool",
+                "default": false
             }
         }
     },
@@ -52,10 +57,10 @@
     },
     "steps": {
         "change_detection": {
-            "id": "change_detection",
+            "id": "cd_seg_workflow/change",
             "name": "变化检测",
             "entry": "main.py",
-            "conda_env": "clbase_1",
+            "conda_env": "clcd_2",
             "process": "single",
             "high_resource": true,
             "parameters": {
@@ -67,6 +72,10 @@
                     "post_image": {
                         "from_step": "@entry",
                         "from_name": "post_image"
+                    },
+                    "use_two_models": {
+                        "from_step": "@entry",
+                        "from_name": "use_two_models"
                     }
                 },
                 "output": {
@@ -82,10 +91,10 @@
             }
         },
         "change_classification": {
-            "id": "change_classification",
+            "id": "cd_seg_workflow/fenlei",
             "name": "变化检测类别识别",
             "entry": "main.py",
-            "conda_env": "clbase_1",
+            "conda_env": "clcd_2",
             "process": "single",
             "high_resource": true,
             "parameters": {

@@ -542,6 +542,97 @@ class MultiGpuInferenceTests(unittest.TestCase):
         self.assertIn("'worker_init_fn': reopen_infer_data_worker", run_path.read_text(encoding="utf-8"))
 
 
+class DualModelWorkflowTests(unittest.TestCase):
+    def test_workflow_exposes_optional_dual_model_flag(self):
+        workflow = json.loads((ROOT / "change_detection_wf.json").read_text(encoding="utf-8"))
+        dual_parameter = workflow["input"]["parameters"]["use_two_models"]
+        self.assertEqual(dual_parameter["type"], "bool")
+        self.assertFalse(dual_parameter["default"])
+
+        change_step = workflow["steps"]["change_detection"]
+        self.assertEqual(change_step["id"], "cd_seg_workflow/change")
+        self.assertEqual(change_step["conda_env"], "clcd_2")
+        self.assertEqual(
+            change_step["parameters"]["input"]["use_two_models"],
+            {"from_step": "@entry", "from_name": "use_two_models"},
+        )
+        self.assertEqual(
+            workflow["steps"]["change_classification"]["id"],
+            "cd_seg_workflow/fenlei",
+        )
+
+    def test_cli_boolean_parser_handles_false_strings(self):
+        source_path = ROOT / "change" / "main.py"
+        tree = ast.parse(source_path.read_text(encoding="utf-8"))
+        parse_bool = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "parse_bool"
+        )
+        namespace = {}
+        exec(
+            compile(ast.Module(body=[parse_bool], type_ignores=[]), str(source_path), "exec"),
+            namespace,
+        )
+        self.assertFalse(namespace["parse_bool"]("false"))
+        self.assertFalse(namespace["parse_bool"]("0"))
+        self.assertTrue(namespace["parse_bool"]("true"))
+        self.assertTrue(namespace["parse_bool"]("1"))
+        with self.assertRaises(ValueError):
+            namespace["parse_bool"]("invalid")
+
+    def test_dual_model_is_loaded_only_when_enabled_and_uses_or_fusion(self):
+        source = (
+            ROOT / "change" / "test_lib_batch_memeff_single_image_nomp.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("'USE_TWO_MODELS': use_two_models", source)
+        self.assertIn("net2 = None", source)
+        self.assertIn("if getattr(cfg, 'USE_TWO_MODELS', False):", source)
+        self.assertIn("output = np.bitwise_or(output, output2)", source)
+        self.assertIn("变化检测第二模型", source)
+        self.assertFalse(
+            (ROOT / "change" / "test_lib_batch_memeff_single_image_nomp_2pth.py").exists()
+        )
+
+    def test_module_metadata_defaults_to_one_model(self):
+        metadata = (ROOT / "change" / "metadata.yml").read_text(encoding="utf-8")
+        self.assertIn('id: "use_two_models"', metadata)
+        self.assertIn('name: "是否使用双模型融合"', metadata)
+        self.assertRegex(
+            metadata,
+            r'id: "use_two_models"[\s\S]*?default: false',
+        )
+        self.assertIn('default: "./FBCD_test_Levir_CD_best_acc.pth"', metadata)
+        self.assertIn('default: "./FBCD_test_select0207_best_acc.pth"', metadata)
+
+    def test_checkpoint_resolver_prefers_explicit_path_then_module_fallback(self):
+        source_path = ROOT / "change" / "test_lib_batch_memeff_single_image_nomp.py"
+        tree = ast.parse(source_path.read_text(encoding="utf-8"))
+        resolver = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_resolve_checkpoint_path"
+        )
+        namespace = {"Path": Path}
+        exec(
+            compile(ast.Module(body=[resolver], type_ignores=[]), str(source_path), "exec"),
+            namespace,
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            module_dir = Path(temp_dir)
+            fallback = module_dir / "fallback.pth"
+            explicit = module_dir / "explicit.pth"
+            fallback.write_bytes(b"fallback")
+            explicit.write_bytes(b"explicit")
+            resolve = namespace["_resolve_checkpoint_path"]
+            self.assertEqual(
+                resolve(module_dir, explicit, fallback.name, "model"),
+                explicit.resolve(),
+            )
+            self.assertEqual(
+                resolve(module_dir, "missing.pth", fallback.name, "model"),
+                fallback.resolve(),
+            )
+
+
 class PersistentDiagnosticsTests(unittest.TestCase):
     @staticmethod
     def _load_functions(source_path, function_names, namespace):
