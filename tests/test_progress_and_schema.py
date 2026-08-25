@@ -394,10 +394,10 @@ class EntryProgressTests(unittest.TestCase):
 
     def test_change_progress_reports_tiff_size_and_eta_and_cleans_scratch(self):
         source = (ROOT / "change" / "change_detection_core.py").read_text(encoding="utf-8")
-        self.assertIn("os.path.getsize(_tif_path)", source)
+        self.assertIn("os.path.getsize(active_tif_path)", source)
         self.assertIn("TIFF已写", source)
         self.assertIn("任务剩余约", source)
-        self.assertIn("finally:\n            if pair_scratch_dir is not None:", source)
+        self.assertIn("finally:\n        if pair_scratch_dir is not None:", source)
         self.assertIn("shutil.rmtree(pair_scratch_dir, ignore_errors=True)", source)
 
     def test_change_fft_tiles_are_small_enough_for_parallel_preprocessing(self):
@@ -405,7 +405,7 @@ class EntryProgressTests(unittest.TestCase):
             ROOT / "change" / "test_lib_batch_memeff_single_image_nomp.py"
         ).read_text(encoding="utf-8")
         self.assertIn("'TEST_IMG_SIZE': 1280", source)
-        self.assertIn("'TEST_BATCHES': max(1, gpu_count)", source)
+        self.assertIn("'TEST_BATCHES': 1", source)
         self.assertIn("'TEST_PREFETCH_FACTOR': 1", source)
 
     def test_classification_temp_dirs_are_cleaned_on_entry_exit(self):
@@ -466,15 +466,19 @@ class PreviewTests(unittest.TestCase):
 
 
 class MultiGpuInferenceTests(unittest.TestCase):
-    def test_change_detection_uses_single_writer_data_parallel(self):
-        source = (
+    def test_change_detection_uses_one_image_process_per_gpu(self):
+        inference_source = (
             ROOT / "change" / "test_lib_batch_memeff_single_image_nomp.py"
         ).read_text(encoding="utf-8")
-        self.assertIn("torch.cuda.device_count() if torch.cuda.is_available() else 0", source)
-        self.assertIn("'TEST_BATCHES': max(1, gpu_count)", source)
-        self.assertIn("net = torch.nn.DataParallel(", source)
-        self.assertIn("device_ids=list(range(gpu_count))", source)
-        self.assertNotIn("mp.spawn(test_lib", source)
+        batch_source = (ROOT / "change" / "change_detection_core.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("'TEST_BATCHES': 1", inference_source)
+        self.assertNotIn("net = torch.nn.DataParallel(", inference_source)
+        self.assertIn("multiprocessing.get_context('spawn')", batch_source)
+        self.assertIn("target=_change_pair_worker", batch_source)
+        self.assertIn("os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_slot)", batch_source)
+        self.assertIn("parallel_jobs = min(total, gpu_count)", batch_source)
 
     def test_change_detection_progress_and_indexes_are_batch_safe(self):
         source = (
@@ -492,12 +496,15 @@ class MultiGpuInferenceTests(unittest.TestCase):
             node for node in tree.body
             if isinstance(node, ast.FunctionDef) and node.name == "_recommended_dataloader_workers"
         )
-        namespace = {"_available_cpu_count": lambda: 60}
+        fake_os = types.SimpleNamespace(environ={})
+        namespace = {"_available_cpu_count": lambda: 60, "os": fake_os}
         exec(
             compile(ast.Module(body=[worker_function], type_ignores=[]), str(source_path), "exec"),
             namespace,
         )
         self.assertEqual(namespace["_recommended_dataloader_workers"](), 48)
+        fake_os.environ["CHANGE_DETECTION_PARALLEL_JOBS"] = "2"
+        self.assertEqual(namespace["_recommended_dataloader_workers"](), 24)
 
     def test_classification_handles_zero_one_and_multiple_visible_gpus(self):
         source = (

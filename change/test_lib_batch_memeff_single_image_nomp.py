@@ -2,6 +2,7 @@ import os
 import glob
 import cv2
 import shutil
+import gc
 from pathlib import Path
 from time import sleep
 import numpy as np
@@ -67,9 +68,14 @@ def _available_cpu_count():
 
 
 def _recommended_dataloader_workers():
-    """使用约 80% 的容器 CPU，最多 48 个进程，给主进程和 GDAL 留出余量。"""
+    """按并行影像任务数均分约 80% 的容器 CPU，给主进程和 GDAL 留出余量。"""
     available_cpus = _available_cpu_count()
-    return max(1, min(48, int(available_cpus * 0.8)))
+    try:
+        parallel_jobs = max(1, int(os.environ.get('CHANGE_DETECTION_PARALLEL_JOBS', '1')))
+    except (TypeError, ValueError):
+        parallel_jobs = 1
+    workers_per_job = int(available_cpus * 0.8) // parallel_jobs
+    return max(1, min(48, workers_per_job))
 
 def CalHistogram(img):
     
@@ -849,7 +855,10 @@ def test_lib_big_memeff(pre_img_path='', post_img_path='', output_path='', logge
         else:
             logger.info('变化检测使用单模型模式')
 
-    gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    # 一个进程只使用一张可见 GPU。文件夹批处理由外层按影像启动独立进程，
+    # 避免 VMamba 动态绑定的 forward 方法被 DataParallel 复制后跨设备引用。
+    visible_gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    gpu_count = 1 if visible_gpu_count > 0 else 0
     kwargs = {
         'PRE_IMG_PATH': pre_img_path,
         'POST_IMG_PATH': post_img_path,
@@ -864,10 +873,9 @@ def test_lib_big_memeff(pre_img_path='', post_img_path='', output_path='', logge
         'MODEL_NAME': 'FBCD',
         'MODEL_BACKBONE': 'vssm_tiny',
         'MODEL_NUM_CLASSES': 1,
-        # 单进程 DataParallel 按 batch 维度分发：双卡 batch=2，单卡/CPU batch=1。
-        # 写出仍只在主进程进行，避免多个 GPU 进程并发写同一个 TIFF。
-        'TEST_BATCHES': max(1, gpu_count),
-        # 根据 Pod 的 CPU 配额自动使用约 80%：16 CPU -> 12，60 CPU -> 48。
+        # 每个影像进程固定使用一张 GPU；不同影像由外层进程并行调度。
+        'TEST_BATCHES': 1,
+        # 根据 Pod CPU 配额和并行影像数均分约 80%：60 CPU、双卡并行约每卡 24。
         # 其余 CPU 留给主进程、GPU 喂数、GDAL 写出和消息线程。
         'TEST_NUM_WORKERS': _recommended_dataloader_workers(),
         'TEST_PREFETCH_FACTOR': 1,
@@ -887,7 +895,7 @@ def test_lib_big_memeff(pre_img_path='', post_img_path='', output_path='', logge
     if logger is not None:
         logger.info("开始推理过程------")
 
-    # 多卡使用单进程 DataParallel。GDAL 输出只由该进程写入，避免 DDP 多进程争写。
+    # 每个调用只写当前影像的结果；文件夹模式在外层按 GPU 并行不同影像。
     test_lib(0, gpu_count, cfg, logger, progress_callback=progress_callback)
 
     # 修改临时目录清理逻辑，使用指定的后缀
@@ -915,7 +923,7 @@ def generate_namelist_from_file(name_list_file, file_root,  suffix):
     return name_list
 
 
-def _load_change_model(checkpoint_path, cfg, device, gpu_count):
+def _load_change_model(checkpoint_path, cfg, device):
     net = GenerateNet(cfg)
     pretrained_dict = torch.load(checkpoint_path, map_location='cpu')
     module_model_state_dict = {}
@@ -925,12 +933,6 @@ def _load_change_model(checkpoint_path, cfg, device, gpu_count):
         module_model_state_dict[item] = value
     net.load_state_dict(module_model_state_dict, strict=True)
     net.to(device)
-    if gpu_count > 1:
-        net = torch.nn.DataParallel(
-            net,
-            device_ids=list(range(gpu_count)),
-            output_device=0,
-        )
     net.eval()
     return net
 
@@ -990,10 +992,10 @@ def test_lib(local_rank, gpu_count, cfg, logger, progress_callback=None):
                 logger.info(f"创建临时目录: {temp_dir_path}")
 
     # 默认只加载主模型；双模型开关打开时才额外占用显存加载第二模型。
-    net = _load_change_model(cfg.TEST_CKPT, cfg, device, gpu_count)
+    net = _load_change_model(cfg.TEST_CKPT, cfg, device)
     net2 = None
     if getattr(cfg, 'USE_TWO_MODELS', False):
-        net2 = _load_change_model(cfg.TEST_CKPT_2, cfg, device, gpu_count)
+        net2 = _load_change_model(cfg.TEST_CKPT_2, cfg, device)
         if logger is not None:
             logger.info('两个变化检测模型均已加载，推理结果将执行 OR 融合')
 
@@ -1349,3 +1351,12 @@ def test_lib(local_rank, gpu_count, cfg, logger, progress_callback=None):
             except Exception as e:
                 if logger is not None:
                     logger.warning(f"清理临时目录失败: {temp_dir_path}, 错误: {str(e)}")
+
+    # VMamba 内部存在绑定方法形成的引用环；同一 GPU 进程继续领取下一张影像前，
+    # 主动回收上一张的模型和 CUDA 缓存，避免批量任务显存逐张累积。
+    del net
+    if net2 is not None:
+        del net2
+    gc.collect()
+    if gpu_count > 0:
+        torch.cuda.empty_cache()

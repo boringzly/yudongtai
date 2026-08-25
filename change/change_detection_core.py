@@ -7,6 +7,8 @@ import tempfile
 import time
 import logging
 import traceback
+import multiprocessing
+import queue
 from pathlib import Path
 
 try:
@@ -299,6 +301,219 @@ def _format_duration(seconds):
     return f'{secs}秒'
 
 
+def _detect_change_gpu_count():
+    """检测当前 Pod 内可用 GPU 数量，并允许通过环境变量降低并行度。"""
+    try:
+        import torch
+        detected = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    except Exception:
+        detected = 0
+
+    configured = os.environ.get('CHANGE_DETECTION_GPU_WORKERS')
+    if configured not in (None, ''):
+        try:
+            detected = min(detected, max(0, int(configured)))
+        except (TypeError, ValueError):
+            pass
+    return detected
+
+
+def _change_pair_worker(task_queue, event_queue, staging_lock, gpu_slot, parallel_jobs):
+    """一个进程独占一张 GPU，持续领取影像对执行推理。"""
+    if gpu_slot is None:
+        os.environ['CUDA_VISIBLE_DEVICES'] = ''
+        worker_label = 'CPU'
+    else:
+        # 在子进程导入 torch 前屏蔽其他 GPU；进程内该卡统一编号为 cuda:0。
+        os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_slot)
+        worker_label = f'GPU {gpu_slot + 1}'
+    os.environ['CHANGE_DETECTION_PARALLEL_JOBS'] = str(max(1, parallel_jobs))
+
+    while True:
+        task = task_queue.get()
+        if task is None:
+            break
+        _process_change_pair(task, event_queue, staging_lock, worker_label)
+
+
+def _process_change_pair(task, event_queue, staging_lock, worker_label):
+    """在已绑定 GPU 的子进程中处理一对影像，并只通过队列回传状态。"""
+    idx = task['idx']
+    stem = task['stem']
+    pre_path = Path(task['pre_path'])
+    post_path = Path(task['post_path'])
+    output_shp = task['output_shp']
+    shp_dir = task['shp_dir']
+    tif_dir = task['tif_dir']
+    pair_started_at = time.monotonic()
+    log_suffix = worker_label.lower().replace(' ', '_')
+    logger, log_path = _configure_persistent_logger(
+        f'change_detection_{log_suffix}',
+        task['dst_path'],
+        filename=f'change_detection_{log_suffix}.log',
+    )
+    event_queue.put({
+        'type': 'started',
+        'idx': idx,
+        'stem': stem,
+        'worker': worker_label,
+        'log_path': log_path,
+    })
+    logger.info(
+        'Processing (%s/%s) on %s: pre=%s, post=%s -> %s',
+        idx + 1,
+        task['total'],
+        worker_label,
+        pre_path,
+        post_path,
+        output_shp,
+    )
+
+    pair_scratch_dir = None
+    result = None
+    try:
+        # 必须在 CUDA_VISIBLE_DEVICES 设置完成后导入，确保本进程只看到绑定的卡。
+        from test_lib_batch_memeff_single_image_nomp import test_lib_big_memeff
+
+        shared_tif_src = os.path.join(shp_dir, f'{stem}.tif')
+        tif_dst = os.path.join(tif_dir, f'{stem}.tif')
+        _remove_shapefile_dataset(output_shp)
+        _remove_file_if_exists(shared_tif_src)
+        _remove_file_if_exists(tif_dst)
+
+        run_pre_path = str(pre_path)
+        run_post_path = str(post_path)
+        run_output_shp = output_shp
+        try:
+            # 空间检查和实际复制放在同一把跨进程锁内，避免两个 GPU 任务同时
+            # 看到相同的剩余空间后共同突破 Pod 的 ephemeral-storage 限制。
+            with staging_lock:
+                pair_scratch_dir = _create_local_pair_scratch(pre_path, post_path)
+                local_pre_dir = os.path.join(pair_scratch_dir, 'input', 'pre')
+                local_post_dir = os.path.join(pair_scratch_dir, 'input', 'post')
+                local_output_dir = os.path.join(pair_scratch_dir, 'output')
+                os.makedirs(local_pre_dir, exist_ok=True)
+                os.makedirs(local_post_dir, exist_ok=True)
+                os.makedirs(local_output_dir, exist_ok=True)
+                run_pre_path = os.path.join(local_pre_dir, pre_path.name)
+                run_post_path = os.path.join(local_post_dir, post_path.name)
+                run_output_shp = os.path.join(local_output_dir, f'{stem}.shp')
+
+                logger.info('复制前时相影像到本地: %s -> %s', pre_path, run_pre_path)
+                shutil.copy2(str(pre_path), run_pre_path)
+                logger.info('复制后时相影像到本地: %s -> %s', post_path, run_post_path)
+                shutil.copy2(str(post_path), run_post_path)
+                logger.info('本地暂存完成，工作目录: %s', pair_scratch_dir)
+        except Exception as staging_error:
+            if pair_scratch_dir is not None:
+                shutil.rmtree(pair_scratch_dir, ignore_errors=True)
+            pair_scratch_dir = None
+            run_pre_path = str(pre_path)
+            run_post_path = str(post_path)
+            run_output_shp = output_shp
+            logger.warning(
+                '本地暂存不可用，回退到共享盘直接处理: %s',
+                staging_error,
+                exc_info=True,
+            )
+
+        active_tif_path = os.path.join(os.path.dirname(run_output_shp), f'{stem}.tif')
+        inference_started_at = time.monotonic()
+        last_report_at = [0.0]
+
+        def _progress_callback(current, total_patches):
+            now = time.monotonic()
+            if current < total_patches and now - last_report_at[0] < 5:
+                return
+            last_report_at[0] = now
+            inference_elapsed = max(now - inference_started_at, 0.001)
+            pair_eta = inference_elapsed / max(current, 1) * max(total_patches - current, 0)
+            tif_size = os.path.getsize(active_tif_path) if os.path.isfile(active_tif_path) else 0
+            estimated_tif_size = int(tif_size / max(current, 1) * total_patches)
+            event_queue.put({
+                'type': 'progress',
+                'idx': idx,
+                'stem': stem,
+                'worker': worker_label,
+                'current': current,
+                'total_patches': total_patches,
+                'pair_eta': pair_eta,
+                'pair_estimated_total': inference_elapsed + pair_eta,
+                'tif_size': tif_size,
+                'estimated_tif_size': estimated_tif_size,
+            })
+
+        test_lib_big_memeff(
+            pre_img_path=run_pre_path,
+            post_img_path=run_post_path,
+            output_path=run_output_shp,
+            logger=logger,
+            callback_url=None,
+            job_id=None,
+            temp_dir_suffix=f'tmp_{idx}_{os.getpid()}',
+            progress_callback=_progress_callback,
+            model_path=task['model_path'],
+            use_two_models=task['use_two_models'],
+            second_model_path=task['second_model_path'],
+        )
+        if not os.path.exists(run_output_shp):
+            raise NonFatalTaskWarning(f'变化检测未生成结果文件: {run_output_shp}')
+
+        if pair_scratch_dir is not None:
+            if os.path.exists(active_tif_path):
+                _copy_file_atomically(active_tif_path, tif_dst)
+            _copy_shapefile_dataset(run_output_shp, output_shp)
+        elif os.path.exists(shared_tif_src):
+            shutil.move(shared_tif_src, tif_dst)
+
+        if not os.path.exists(output_shp):
+            raise NonFatalTaskWarning(f'变化检测结果复制后缺失: {output_shp}')
+        feature_count = _shapefile_feature_count(output_shp)
+        if feature_count == 0:
+            logger.info('处理 %s 完成：未检测到变化图斑，输出有效空 SHP', stem)
+        else:
+            logger.info('处理 %s 完成：检测到 %s 个变化图斑', stem, feature_count)
+        result = {
+            'type': 'result',
+            'status': 'completed',
+            'idx': idx,
+            'stem': stem,
+            'worker': worker_label,
+            'output_shp': output_shp,
+            'feature_count': feature_count,
+            'duration': time.monotonic() - pair_started_at,
+            'log_path': log_path,
+        }
+    except Exception as error:
+        error_traceback = traceback.format_exc()
+        logger.exception('处理 %s 失败，已跳过: %s', stem, error)
+        result = {
+            'type': 'result',
+            'status': 'failed',
+            'idx': idx,
+            'stem': stem,
+            'worker': worker_label,
+            'error': str(error),
+            'traceback': error_traceback,
+            'duration': time.monotonic() - pair_started_at,
+            'log_path': log_path,
+        }
+    finally:
+        if pair_scratch_dir is not None:
+            shutil.rmtree(pair_scratch_dir, ignore_errors=True)
+            logger.info('已清理本地临时目录: %s', pair_scratch_dir)
+        try:
+            import gc
+            import torch
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+    event_queue.put(result)
+
+
 # ========== DatasetBuilder ==========
 
 from DatasetBuilder import DatasetBuilder
@@ -450,157 +665,188 @@ def change_detection_folder(pre_folder, post_folder, model_path, dst_path, outpu
     logger, log_path = _configure_persistent_logger('change_detection_batch', dst_path)
     logger.info('持久化日志: %s', log_path)
 
-    from test_lib_batch_memeff_single_image_nomp import test_lib_big_memeff
-
     output_shp_list = []
     failed_list = []
     empty_result_list = []
     feature_counts = {}
+    gpu_count = _detect_change_gpu_count()
+    parallel_jobs = min(total, gpu_count) if gpu_count > 0 else 1
+    execution_label = (
+        f'{parallel_jobs} 张 GPU 影像级并行，每张 GPU 独立处理一对影像'
+        if gpu_count > 0
+        else '未检测到 GPU，使用单个 CPU 进程'
+    )
+    logger.info('变化检测执行方式: %s', execution_label)
+    prg_sender.send({
+        'progress': 5,
+        'runningStatus': 'running',
+        'runningInfo': execution_label,
+    })
 
+    context = multiprocessing.get_context('spawn')
+    task_queue = context.Queue()
+    event_queue = context.Queue()
+    staging_lock = context.Lock()
     for idx, (pre_path, post_path) in enumerate(valid_pairs):
         stem = pre_path.stem
-        output_shp = os.path.join(shp_dir, f'{stem}.shp')
-        pair_started_at = time.monotonic()
-
-        progress_pct = prg_sender.calc_progress_value(idx, total, 5, 95)
-        prg_sender.send({
-            'progress': progress_pct,
-            'runningStatus': 'running',
-            'runningInfo': f'变化检测中 ({idx+1}/{total}): {stem}'
+        task_queue.put({
+            'idx': idx,
+            'total': total,
+            'stem': stem,
+            'pre_path': str(pre_path),
+            'post_path': str(post_path),
+            'output_shp': os.path.join(shp_dir, f'{stem}.shp'),
+            'shp_dir': shp_dir,
+            'tif_dir': tif_dir,
+            'dst_path': dst_path,
+            'model_path': model_path,
+            'use_two_models': use_two_models,
+            'second_model_path': second_model_path,
         })
+    for _ in range(parallel_jobs):
+        task_queue.put(None)
 
-        logger.info(f'Processing ({idx+1}/{total}): pre={pre_path}, post={post_path} -> {output_shp}')
+    workers = []
+    for worker_index in range(parallel_jobs):
+        gpu_slot = worker_index if gpu_count > 0 else None
+        process = context.Process(
+            target=_change_pair_worker,
+            args=(task_queue, event_queue, staging_lock, gpu_slot, parallel_jobs),
+            name=f'change-detection-{worker_index}',
+        )
+        process.start()
+        workers.append(process)
 
-        def _make_batch_cb(_stem, _idx, _tif_path, _pair_started_at, _inference_started_at):
-            def _cb(current, total_patches):
-                inner_pct = current / max(total_patches, 1)
-                pct = prg_sender.calc_progress_value(_idx + inner_pct, total, 5, 95)
-                elapsed_pair = max(time.monotonic() - _pair_started_at, 0.001)
-                inference_elapsed = max(time.monotonic() - _inference_started_at, 0.001)
-                pair_eta = inference_elapsed / max(current, 1) * max(total_patches - current, 0)
-                estimated_pair_total = elapsed_pair + pair_eta
-                job_eta = pair_eta + estimated_pair_total * max(total - _idx - 1, 0)
+    pair_progress = {idx: 0.0 for idx in range(total)}
+    results_by_index = {}
+    dead_queue_polls = 0
+    try:
+        while len(results_by_index) < total:
+            try:
+                event = event_queue.get(timeout=1)
+            except queue.Empty:
+                if any(process.is_alive() for process in workers):
+                    dead_queue_polls = 0
+                    continue
+                # 子进程退出后给 Queue 的后台刷新线程一点时间。
+                dead_queue_polls += 1
+                if dead_queue_polls < 3:
+                    continue
+                break
 
-                tif_size = os.path.getsize(_tif_path) if os.path.isfile(_tif_path) else 0
-                estimated_tif_size = int(tif_size / max(current, 1) * total_patches)
+            dead_queue_polls = 0
+            event_type = event.get('type')
+            idx = event.get('idx')
+            stem = event.get('stem', '')
+            worker_label = event.get('worker', 'worker')
+
+            if event_type == 'started':
+                logger.info(
+                    '%s 开始处理 (%s/%s) %s；子进程日志: %s',
+                    worker_label,
+                    idx + 1,
+                    total,
+                    stem,
+                    event.get('log_path'),
+                )
+                prg_sender.send({
+                    'progress': prg_sender.calc_progress_value(sum(pair_progress.values()), total, 5, 95),
+                    'runningStatus': 'running',
+                    'runningInfo': f'{worker_label} 开始处理 ({idx+1}/{total}): {stem}',
+                })
+                continue
+
+            if event_type == 'progress':
+                current = event['current']
+                total_patches = event['total_patches']
+                pair_progress[idx] = min(1.0, current / max(total_patches, 1))
+                overall_progress = prg_sender.calc_progress_value(
+                    sum(pair_progress.values()), total, 5, 95
+                )
+                remaining_work = sum(1.0 - value for value in pair_progress.values())
+                estimated_total = max(event.get('pair_estimated_total', 0), 0.001)
+                job_eta = estimated_total * remaining_work / max(parallel_jobs, 1)
                 running_info = (
-                    f'变化检测 ({_idx+1}/{total}) {_stem}: '
-                    f'{current}/{total_patches}切片，TIFF已写{_format_file_size(tif_size)}'
-                    f'（预计{_format_file_size(estimated_tif_size)}），'
-                    f'本图剩余约{_format_duration(pair_eta)}，任务剩余约{_format_duration(job_eta)}'
+                    f'{worker_label} 变化检测 ({idx+1}/{total}) {stem}: '
+                    f'{current}/{total_patches}切片，'
+                    f'TIFF已写{_format_file_size(event.get("tif_size", 0))}'
+                    f'（预计{_format_file_size(event.get("estimated_tif_size", 0))}），'
+                    f'本图剩余约{_format_duration(event.get("pair_eta", 0))}，'
+                    f'任务剩余约{_format_duration(job_eta)}'
                 )
                 logger.info(running_info)
                 prg_sender.send({
-                    'progress': pct,
+                    'progress': overall_progress,
                     'runningStatus': 'running',
-                    'runningInfo': running_info
+                    'runningInfo': running_info,
                 })
-            return _cb
+                continue
 
-        pair_scratch_dir = None
-        try:
-            shared_tif_src = os.path.join(shp_dir, f'{stem}.tif')
-            tif_dst = os.path.join(tif_dir, f'{stem}.tif')
-            _remove_shapefile_dataset(output_shp)
-            _remove_file_if_exists(shared_tif_src)
-            _remove_file_if_exists(tif_dst)
-
-            run_pre_path = str(pre_path)
-            run_post_path = str(post_path)
-            run_output_shp = output_shp
-            try:
-                pair_scratch_dir = _create_local_pair_scratch(pre_path, post_path)
-                local_pre_dir = os.path.join(pair_scratch_dir, 'input', 'pre')
-                local_post_dir = os.path.join(pair_scratch_dir, 'input', 'post')
-                local_output_dir = os.path.join(pair_scratch_dir, 'output')
-                os.makedirs(local_pre_dir, exist_ok=True)
-                os.makedirs(local_post_dir, exist_ok=True)
-                os.makedirs(local_output_dir, exist_ok=True)
-                run_pre_path = os.path.join(local_pre_dir, pre_path.name)
-                run_post_path = os.path.join(local_post_dir, post_path.name)
-                run_output_shp = os.path.join(local_output_dir, f'{stem}.shp')
-
-                prg_sender.send({
-                    'progress': progress_pct,
-                    'runningStatus': 'running',
-                    'runningInfo': f'正在将第 {idx+1}/{total} 对影像复制到本地临时盘'
-                })
-                logger.info('复制前时相影像到本地: %s -> %s', pre_path, run_pre_path)
-                shutil.copy2(str(pre_path), run_pre_path)
-                logger.info('复制后时相影像到本地: %s -> %s', post_path, run_post_path)
-                shutil.copy2(str(post_path), run_post_path)
-                logger.info('本地暂存完成，工作目录: %s', pair_scratch_dir)
-            except Exception as staging_error:
-                if pair_scratch_dir is not None:
-                    shutil.rmtree(pair_scratch_dir, ignore_errors=True)
-                pair_scratch_dir = None
-                run_pre_path = str(pre_path)
-                run_post_path = str(post_path)
-                run_output_shp = output_shp
-                logger.warning(
-                    '本地暂存不可用，回退到共享盘直接处理: %s',
-                    staging_error,
-                    exc_info=True,
+            if event_type == 'result':
+                results_by_index[idx] = event
+                pair_progress[idx] = 1.0
+                overall_progress = prg_sender.calc_progress_value(
+                    sum(pair_progress.values()), total, 5, 95
                 )
+                if event.get('status') == 'completed':
+                    logger.info(
+                        '%s 完成 (%s/%s) %s，图斑数=%s，用时=%s',
+                        worker_label,
+                        idx + 1,
+                        total,
+                        stem,
+                        event.get('feature_count'),
+                        _format_duration(event.get('duration', 0)),
+                    )
+                    result_info = f'{worker_label} 已完成 ({len(results_by_index)}/{total}): {stem}'
+                else:
+                    logger.error(
+                        '%s 处理 (%s/%s) %s 失败: %s\n%s',
+                        worker_label,
+                        idx + 1,
+                        total,
+                        stem,
+                        event.get('error'),
+                        event.get('traceback', ''),
+                    )
+                    result_info = f'{worker_label} 处理失败并跳过 ({len(results_by_index)}/{total}): {stem}'
                 prg_sender.send({
-                    'progress': progress_pct,
+                    'progress': overall_progress,
                     'runningStatus': 'running',
-                    'runningInfo': f'本地暂存不可用，第 {idx+1}/{total} 对影像改用共享盘处理'
+                    'runningInfo': result_info,
                 })
+    finally:
+        for process in workers:
+            process.join(timeout=5)
+        for process in workers:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+        task_queue.close()
+        event_queue.close()
 
-            active_tif_path = os.path.join(os.path.dirname(run_output_shp), f'{stem}.tif')
-            inference_started_at = time.monotonic()
-            test_lib_big_memeff(
-                pre_img_path=run_pre_path,
-                post_img_path=run_post_path,
-                output_path=run_output_shp,
-                logger=logger,
-                callback_url=None,
-                job_id=None,
-                temp_dir_suffix="tmp",
-                progress_callback=_make_batch_cb(
-                    stem,
-                    idx,
-                    active_tif_path,
-                    pair_started_at,
-                    inference_started_at,
-                ),
-                model_path=model_path,
-                use_two_models=use_two_models,
-                second_model_path=second_model_path,
-            )
-            if not os.path.exists(run_output_shp):
-                raise NonFatalTaskWarning(f'变化检测未生成结果文件: {run_output_shp}')
-
-            if pair_scratch_dir is not None:
-                prg_sender.send({
-                    'progress': prg_sender.calc_progress_value(idx + 1, total, 5, 95),
-                    'runningStatus': 'running',
-                    'runningInfo': f'第 {idx+1}/{total} 对推理完成，正在复制结果回共享盘'
-                })
-                if os.path.exists(active_tif_path):
-                    _copy_file_atomically(active_tif_path, tif_dst)
-                _copy_shapefile_dataset(run_output_shp, output_shp)
-            elif os.path.exists(shared_tif_src):
-                shutil.move(shared_tif_src, tif_dst)
-
-            if not os.path.exists(output_shp):
-                raise NonFatalTaskWarning(f'变化检测结果复制后缺失: {output_shp}')
-            feature_count = _shapefile_feature_count(output_shp)
-            feature_counts[stem] = feature_count
-            if feature_count == 0:
-                empty_result_list.append(stem)
-                logger.info('处理 %s 完成：未检测到变化图斑，输出有效空 SHP', stem)
-            else:
-                logger.info('处理 %s 完成：检测到 %s 个变化图斑', stem, feature_count)
-            output_shp_list.append(output_shp)
-        except Exception as e:
-            logger.exception('处理 %s 失败，已跳过: %s', stem, e)
-            failed_list.append({'file': stem, 'error': str(e)})
-        finally:
-            if pair_scratch_dir is not None:
-                shutil.rmtree(pair_scratch_dir, ignore_errors=True)
-                logger.info('已清理本地临时目录: %s', pair_scratch_dir)
+    for idx, (pre_path, _) in enumerate(valid_pairs):
+        stem = pre_path.stem
+        result = results_by_index.get(idx)
+        if result is None:
+            failed_list.append({
+                'file': stem,
+                'error': '影像推理子进程异常退出，未返回结果',
+            })
+            continue
+        if result.get('status') != 'completed':
+            failed_list.append({
+                'file': stem,
+                'error': result.get('error', '未知错误'),
+                'worker': result.get('worker'),
+                'log_path': result.get('log_path'),
+            })
+            continue
+        output_shp_list.append(result['output_shp'])
+        feature_count = int(result['feature_count'])
+        feature_counts[stem] = feature_count
+        if feature_count == 0:
+            empty_result_list.append(stem)
 
     # 7. 先判断是否存在有效结果，避免全失败任务先显示为 95%。
     swap_write('processed_count', len(output_shp_list))
@@ -612,6 +858,9 @@ def change_detection_folder(pre_folder, post_folder, model_path, dst_path, outpu
         _write_diagnostic_report(dst_path, 'change_detection_summary.json', {
             'status': 'failed',
             'mode': 'batch',
+            'parallel_mode': 'one_image_per_gpu',
+            'parallel_jobs': parallel_jobs,
+            'visible_gpu_count': gpu_count,
             'total': total,
             'processed_count': 0,
             'failed_count': len(failed_list),
@@ -642,6 +891,9 @@ def change_detection_folder(pre_folder, post_folder, model_path, dst_path, outpu
     _write_diagnostic_report(dst_path, 'change_detection_summary.json', {
         'status': 'completed_with_warnings' if failed_list else 'completed',
         'mode': 'batch',
+        'parallel_mode': 'one_image_per_gpu',
+        'parallel_jobs': parallel_jobs,
+        'visible_gpu_count': gpu_count,
         'total': total,
         'processed_count': len(output_shp_list),
         'failed_count': len(failed_list),
