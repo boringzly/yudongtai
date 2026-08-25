@@ -462,7 +462,60 @@ class PreviewTests(unittest.TestCase):
         self.assertNotIn("cv2.imwrite(temp_preview_filename", source)
         self.assertNotIn("temp_preview_root", source)
         self.assertIn("_last_subprocess_progress_key", source)
+        self.assertIn("CLIE_INFER_PROGRESS_STEP", source)
+        self.assertIn("CLIE_PROGRESS_MAX_INTERVAL", source)
+        self.assertIn("inferBatchCurrent", source)
+        self.assertIn("inferBatchTotal", source)
+        self.assertIn("return round(", source)
         self.assertIn("message_dict['runningStatus'] = 'running'", source)
+
+    def test_classification_subprocess_progress_keeps_tile_updates(self):
+        source_path = (
+            ROOT / "fenlei" / "clie_new" / "CLInferEngine" / "clie_lib" / "run_lib.py"
+        )
+        tree = ast.parse(source_path.read_text(encoding="utf-8"))
+        wrapper_class = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "ProgressMessageSenderWrap"
+        )
+
+        class RecordingSender:
+            def __init__(self, *args, **kwargs):
+                self.messages = []
+
+            def is_none(self):
+                return False
+
+            def send(self, message):
+                self.messages.append(dict(message))
+                return True
+
+        fake_os = types.SimpleNamespace(environ={
+            "CLIE_INFER_PROGRESS_STEP": "2",
+            "CLIE_PROGRESS_MAX_INTERVAL": "3",
+        })
+        namespace = {
+            "ProgressMessageSender": RecordingSender,
+            "os": fake_os,
+            "time": types.SimpleNamespace(monotonic=lambda: 0.0),
+        }
+        exec(
+            compile(ast.Module(body=[wrapper_class], type_ignores=[]), str(source_path), "exec"),
+            namespace,
+        )
+        sender = namespace["ProgressMessageSenderWrap"]("broker", "topic", "task")
+        sender.set_progress_range(10, 20)
+        base_message = {
+            "runningStatus": "running",
+            "runningInfo": "分类推理",
+            "inferFilename": "image.tif",
+        }
+        self.assertTrue(sender.send(dict(base_message, progress=3, inferProgress=0)))
+        self.assertFalse(sender.send(dict(base_message, progress=4, inferProgress=1)))
+        self.assertTrue(sender.send(dict(base_message, progress=5, inferProgress=2)))
+        self.assertEqual(len(sender.prg_sender.messages), 2)
+        self.assertEqual(sender.prg_sender.messages[0]["progress"], 10.3)
+        self.assertEqual(sender.prg_sender.messages[1]["progress"], 10.5)
 
 
 class MultiGpuInferenceTests(unittest.TestCase):
@@ -507,15 +560,34 @@ class MultiGpuInferenceTests(unittest.TestCase):
         self.assertEqual(namespace["_recommended_dataloader_workers"](), 24)
 
     def test_classification_handles_zero_one_and_multiple_visible_gpus(self):
-        source = (
+        source_path = (
             ROOT / "fenlei" / "clie_new" / "CLInferEngine" / "clie_lib" / "run_lib.py"
-        ).read_text(encoding="utf-8")
+        )
+        source = source_path.read_text(encoding="utf-8")
         self.assertIn("cfg.USE_GPU = num_gpus > 0", source)
         self.assertIn("use_multi_gpu = num_gpus > 1", source)
-        self.assertIn("cfg.TEST_BATCHES = num_gpus if use_multi_gpu", source)
+        self.assertIn("batch_per_gpu = _classification_batch_per_gpu()", source)
+        self.assertIn("else batch_per_gpu * num_gpus", source)
         self.assertIn("model = t.nn.DataParallel(", source)
         self.assertIn("device_ids=list(range(num_gpus))", source)
         self.assertIn("device = t.device('cuda', 0) if cfg.USE_GPU else t.device('cpu')", source)
+
+        tree = ast.parse(source)
+        batch_function = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_classification_batch_per_gpu"
+        )
+        fake_os = types.SimpleNamespace(environ={})
+        namespace = {"os": fake_os}
+        exec(
+            compile(ast.Module(body=[batch_function], type_ignores=[]), str(source_path), "exec"),
+            namespace,
+        )
+        self.assertEqual(namespace["_classification_batch_per_gpu"](), 8)
+        fake_os.environ["CLIE_BATCH_PER_GPU"] = "12"
+        self.assertEqual(namespace["_classification_batch_per_gpu"](), 12)
+        fake_os.environ["CLIE_BATCH_PER_GPU"] = "99"
+        self.assertEqual(namespace["_classification_batch_per_gpu"](), 16)
 
         cost_volume_source = (
             ROOT / "fenlei" / "clie_new" / "networks" / "utils" / "CostVolume.py"

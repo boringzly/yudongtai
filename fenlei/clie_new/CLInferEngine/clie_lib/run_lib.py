@@ -101,6 +101,15 @@ def _recommended_data_workers(gpu_count):
     target = workers_per_gpu * max(1, gpu_count)
     return max(1, min(16, available_cpus, target))
 
+
+def _classification_batch_per_gpu():
+    """L20 分类默认每卡 8 张切片，可通过 CLIE_BATCH_PER_GPU 在 1～16 间调整。"""
+    configured = os.environ.get('CLIE_BATCH_PER_GPU', '8')
+    try:
+        return max(1, min(16, int(configured)))
+    except (TypeError, ValueError):
+        return 8
+
 def resample_to_2m_gdal(image_path):
     image_name = os.path.basename(image_path)
     if "GF02" not in image_name and "GF07" not in image_name and "GF2" not in image_name and "GF7" not in image_name:
@@ -287,17 +296,35 @@ class ProgressMessageSenderWrap():
         self._progress_min = 0
         self._progress_max = 100
         self._last_subprocess_progress_key = None
+        self._last_subprocess_infer_filename = None
+        self._last_subprocess_infer_progress = None
+        self._last_subprocess_send_time = 0.0
+        try:
+            self._subprocess_infer_progress_step = max(
+                1, int(os.environ.get('CLIE_INFER_PROGRESS_STEP', '2'))
+            )
+        except (TypeError, ValueError):
+            self._subprocess_infer_progress_step = 2
+        try:
+            self._subprocess_progress_max_interval = max(
+                1.0, float(os.environ.get('CLIE_PROGRESS_MAX_INTERVAL', '3'))
+            )
+        except (TypeError, ValueError):
+            self._subprocess_progress_max_interval = 3.0
 
     def set_progress_range(self, progress_min, progress_max):
         """设置进度映射区间。当 max < 100 时自动抑制 completed 状态（子进程模式）。"""
-        self._progress_min = int(float(progress_min))
-        self._progress_max = int(float(progress_max))
+        self._progress_min = float(progress_min)
+        self._progress_max = float(progress_max)
 
     def _map_progress(self, pct):
         """将 CLIE 内部 0→100 进度线性映射到父进程的进度区间"""
         if self._progress_min == 0 and self._progress_max == 100:
             return int(pct)
-        return int(self._progress_min + (self._progress_max - self._progress_min) * (pct / 100.0))
+        return round(
+            self._progress_min + (self._progress_max - self._progress_min) * (pct / 100.0),
+            2,
+        )
 
     def _is_subprocess_mode(self):
         return self._progress_max < 100
@@ -315,10 +342,36 @@ class ProgressMessageSenderWrap():
             # 子进程结束不代表整个分类步骤结束，避免提前把前端状态置为 completed。
             message_dict['runningStatus'] = 'running'
             message_dict['progress'] = self._map_progress(message_dict['progress'])
-            progress_key = (message_dict.get('inferFilename'), message_dict.get('progress'))
-            if progress_key == self._last_subprocess_progress_key:
-                return False
-            self._last_subprocess_progress_key = progress_key
+            infer_progress = message_dict.get('inferProgress')
+            infer_filename = message_dict.get('inferFilename')
+            now = time.monotonic()
+            if infer_progress is None:
+                # 初始化、创建写出指针等阶段消息只过滤完全相同的重复项。
+                progress_key = (
+                    infer_filename,
+                    message_dict.get('progress'),
+                    message_dict.get('runningInfo'),
+                )
+                if progress_key == self._last_subprocess_progress_key:
+                    return False
+                self._last_subprocess_progress_key = progress_key
+            else:
+                infer_progress = int(float(infer_progress))
+                filename_changed = infer_filename != self._last_subprocess_infer_filename
+                progress_advanced = (
+                    self._last_subprocess_infer_progress is None
+                    or infer_progress - self._last_subprocess_infer_progress
+                    >= self._subprocess_infer_progress_step
+                )
+                interval_elapsed = (
+                    now - self._last_subprocess_send_time
+                    >= self._subprocess_progress_max_interval
+                )
+                if not (filename_changed or progress_advanced or interval_elapsed or infer_progress >= 100):
+                    return False
+                self._last_subprocess_infer_filename = infer_filename
+                self._last_subprocess_infer_progress = infer_progress
+            self._last_subprocess_send_time = now
         elif 'progress' in message_dict:
             message_dict['progress'] = self._map_progress(message_dict['progress'])
 
@@ -400,7 +453,15 @@ def infer(kwargs):
     num_gpus = t.cuda.device_count() if requested_gpu and t.cuda.is_available() else 0
     cfg.USE_GPU = num_gpus > 0
     use_multi_gpu = num_gpus > 1
-    cfg.TEST_BATCHES = num_gpus if use_multi_gpu and not cfg.USE_DIST else 1
+    batch_per_gpu = _classification_batch_per_gpu()
+    if num_gpus > 0:
+        cfg.TEST_BATCHES = (
+            batch_per_gpu
+            if use_multi_gpu and cfg.USE_DIST
+            else batch_per_gpu * num_gpus
+        )
+    else:
+        cfg.TEST_BATCHES = 1
     data_workers = _recommended_data_workers(num_gpus)
     cfg.PIN_MEMORY = cfg.USE_GPU
 
@@ -423,8 +484,8 @@ def infer(kwargs):
     if cfg.USE_GPU:
         gpu_names = [t.cuda.get_device_name(index) for index in range(num_gpus)]
         logger.info(
-            '分类推理设备: %s 张 GPU, batch_size=%s, data_workers=%s, devices=%s' % (
-                num_gpus, cfg.TEST_BATCHES, data_workers, gpu_names
+                '分类推理设备: %s 张 GPU, batch_per_gpu=%s, batch_size=%s, data_workers=%s, devices=%s' % (
+                num_gpus, batch_per_gpu, cfg.TEST_BATCHES, data_workers, gpu_names
             )
         )
     else:
@@ -480,6 +541,16 @@ def infer(kwargs):
     cfg.set_parse(kwargs)
     if cfg.IS_AGRICULTURE_INFER:
         # 农业模型内部把单张切片再次拆点，目前只支持 batch=1。
+        cfg.TEST_BATCHES = 1
+        logger.info('农业分类模型强制使用 batch_size=1')
+    elif num_gpus > 0:
+        # cfg.set_parse 可能覆盖配置，普通分类在这里重新应用按卡 batch 设置。
+        cfg.TEST_BATCHES = (
+            batch_per_gpu
+            if use_multi_gpu and cfg.USE_DIST
+            else batch_per_gpu * num_gpus
+        )
+    else:
         cfg.TEST_BATCHES = 1
     # color_table = Utils.generate_color_table(cfg.COLOR_TABLE_FI
     task_input = cfg.image_input_file
@@ -921,7 +992,7 @@ def infer(kwargs):
                             if _USE_DIST:
                                 good_data = good_data.cuda(local_rank, non_blocking=cfg.NON_BLOCKING)
                             else:
-                                good_data = good_data.cuda()
+                                good_data = good_data.cuda(non_blocking=cfg.NON_BLOCKING)
 
                         if cfg.TTACH and cfg.FOREGROUND_IDX == 7:
                             tta_transformes = tta_func.Compose([
@@ -1059,8 +1130,10 @@ def infer(kwargs):
 
             _prg_idx = prg_sender.calc_progress_value(idx_x + 1, len(test_dataloader), min_value=_sub_task_prg_min, max_value=_sub_task_prg_max)
             _sub_prg_idx = prg_sender.calc_progress_value(idx_x + 1, len(test_dataloader), min_value=0, max_value=99)
-            message_dict = {'progress': _prg_idx, 'runningStatus': 'running', 'runningInfo': f'推理任务-{idx + 1}/{len(basename_list_list[local_rank])}',
+            message_dict = {'progress': _prg_idx, 'runningStatus': 'running',
+                            'runningInfo': f'分类推理 {os.path.basename(filename)}: {idx_x + 1}/{len(test_dataloader)}批次 ({_sub_prg_idx}%)',
                             'inferProgress': _sub_prg_idx, 'inferFilename': filename,
+                            'inferBatchCurrent': idx_x + 1, 'inferBatchTotal': len(test_dataloader),
                             'inferGeoInfo': infer_geo_info}
             prg_sender.send(message_dict)
 
