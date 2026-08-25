@@ -22,10 +22,10 @@ parameters:
     position: "input"
 
   - id: "model_path"
-    name: "模型权重路径"
+    name: "主模型权重路径"
     type: "str"
     required: false
-    default: "./FBCD_test_Levir_CD_best_acc.pth"
+    default: "./FBCD_test_select0207_best_acc.pth"
     position: "input"
 
   - id: "use_two_models"
@@ -39,7 +39,7 @@ parameters:
     name: "第二模型权重路径"
     type: "str"
     required: false
-    default: "./FBCD_test_select0207_best_acc.pth"
+    default: "./FBCD_test_Levir_CD_best_acc.pth"
     position: "input"
 
   - id: "dst_path"

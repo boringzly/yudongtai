@@ -18,7 +18,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='变化检测 - 前后时相比较检测变化区域')
     parser.add_argument('--pre_image', type=str, required=True, help='前时相影像路径')
     parser.add_argument('--post_image', type=str, required=True, help='后时相影像路径')
-    parser.add_argument('--model_path', type=str, required=False, default='./FBCD_test_Levir_CD_best_acc.pth', help='模型权重路径')
+    parser.add_argument('--model_path', type=str, required=False, default='./FBCD_test_select0207_best_acc.pth', help='主模型权重路径')
     parser.add_argument(
         '--use_two_models',
         type=parse_bool,
@@ -31,7 +31,7 @@ if __name__ == '__main__':
         '--second_model_path',
         type=str,
         required=False,
-        default='./FBCD_test_select0207_best_acc.pth',
+        default='./FBCD_test_Levir_CD_best_acc.pth',
         help='双模型模式下的第二个模型权重路径',
     )
     parser.add_argument('--dst_path', type=str, required=True, help='输出目录路径')

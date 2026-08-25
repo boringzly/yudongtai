@@ -601,8 +601,14 @@ class DualModelWorkflowTests(unittest.TestCase):
             metadata,
             r'id: "use_two_models"[\s\S]*?default: false',
         )
-        self.assertIn('default: "./FBCD_test_Levir_CD_best_acc.pth"', metadata)
-        self.assertIn('default: "./FBCD_test_select0207_best_acc.pth"', metadata)
+        self.assertRegex(
+            metadata,
+            r'id: "model_path"[\s\S]*?default: "\./FBCD_test_select0207_best_acc\.pth"',
+        )
+        self.assertRegex(
+            metadata,
+            r'id: "second_model_path"[\s\S]*?default: "\./FBCD_test_Levir_CD_best_acc\.pth"',
+        )
 
     def test_checkpoint_resolver_prefers_explicit_path_then_module_fallback(self):
         source_path = ROOT / "change" / "test_lib_batch_memeff_single_image_nomp.py"

@@ -827,11 +827,7 @@ def test_lib_big_memeff(pre_img_path='', post_img_path='', output_path='', logge
     checkpoint_path = _resolve_checkpoint_path(
         module_dir,
         model_path,
-        (
-            'FBCD_test_Levir_CD_best_acc.pth'
-            if use_two_models
-            else 'FBCD_test_select0207_best_acc.pth'
-        ),
+        'FBCD_test_select0207_best_acc.pth',
         '变化检测主模型',
     )
     second_checkpoint_path = None
@@ -839,7 +835,7 @@ def test_lib_big_memeff(pre_img_path='', post_img_path='', output_path='', logge
         second_checkpoint_path = _resolve_checkpoint_path(
             module_dir,
             second_model_path,
-            'FBCD_test_select0207_best_acc.pth',
+            'FBCD_test_Levir_CD_best_acc.pth',
             '变化检测第二模型',
         )
         if second_checkpoint_path == checkpoint_path:
