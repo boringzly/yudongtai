@@ -439,6 +439,59 @@ class EntryProgressTests(unittest.TestCase):
         namespace["_cleanup_all_classification_temp_dirs"]()
         self.assertFalse(Path(temp_dir).exists())
 
+    def test_change_mask_tifs_are_removed_only_after_final_merge(self):
+        source_path = ROOT / "fenlei" / "classification_core.py"
+        source = source_path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        cleanup_node = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_cleanup_change_mask_tifs"
+        )
+        namespace = {"Path": Path, "os": os}
+        exec(
+            compile(ast.Module(body=[cleanup_node], type_ignores=[]), str(source_path), "exec"),
+            namespace,
+        )
+
+        class _Logger:
+            def info(self, *args, **kwargs):
+                pass
+
+            def warning(self, *args, **kwargs):
+                pass
+
+        with tempfile.TemporaryDirectory() as temp_root:
+            change_dir = Path(temp_root) / "working" / "change_detection"
+            shp_dir = change_dir / "shp"
+            tif_dir = change_dir / "tif"
+            shp_dir.mkdir(parents=True)
+            tif_dir.mkdir()
+            (tif_dir / "one.tif").write_bytes(b"mask")
+            (tif_dir / "two.TIFF").write_bytes(b"mask")
+            (tif_dir / "keep.txt").write_text("keep", encoding="utf-8")
+
+            result = namespace["_cleanup_change_mask_tifs"](shp_dir, _Logger())
+
+            self.assertEqual(result["removed_count"], 2)
+            self.assertFalse((tif_dir / "one.tif").exists())
+            self.assertFalse((tif_dir / "two.TIFF").exists())
+            self.assertTrue((tif_dir / "keep.txt").exists())
+
+            external_shp = Path(temp_root) / "external" / "shp"
+            external_tif = Path(temp_root) / "external" / "tif"
+            external_shp.mkdir(parents=True)
+            external_tif.mkdir()
+            external_mask = external_tif / "do_not_remove.tif"
+            external_mask.write_bytes(b"source")
+            namespace["_cleanup_change_mask_tifs"](external_shp, _Logger())
+            self.assertTrue(external_mask.exists())
+
+        merge_position = source.index("merged_shp = merge_shp(output_shp_list, merged_shp)")
+        cleanup_position = source.index("mask_tif_cleanup = _cleanup_change_mask_tifs(mask_folder, logger)")
+        self.assertGreater(cleanup_position, merge_position)
+
     def test_empty_zonal_stats_map_to_unknown(self):
         source = (ROOT / "fenlei" / "classification_core.py").read_text(encoding="utf-8")
         self.assertIn("major_classes.append(0)", source)

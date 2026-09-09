@@ -289,6 +289,68 @@ def _cleanup_clie_working_rasters(temp_dir):
     shutil.rmtree(os.path.join(temp_dir, 'tmp'), ignore_errors=True)
 
 
+def _cleanup_change_mask_tifs(mask_folder, logger):
+    """最终分类 SHP 合并成功后，清理变化检测阶段生成的中间 mask TIFF。"""
+    cleanup_result = {
+        'directory': None,
+        'removed_count': 0,
+        'failed_files': [],
+    }
+    mask_path = Path(mask_folder).resolve()
+    mask_dir = mask_path if mask_path.is_dir() else mask_path.parent
+
+    # 只允许清理标准工作流 change_detection/shp 的同级 tif 目录，避免误删外部数据。
+    if mask_dir.name.lower() != 'shp' or mask_dir.parent.name.lower() != 'change_detection':
+        logger.info('掩码不是变化检测标准工作目录，跳过 mask TIFF 清理: %s', mask_dir)
+        return cleanup_result
+
+    mask_tif_dir = mask_dir.parent / 'tif'
+    cleanup_result['directory'] = str(mask_tif_dir)
+    if not mask_tif_dir.is_dir():
+        logger.info('变化检测中间 mask TIFF 目录不存在，无需清理: %s', mask_tif_dir)
+        return cleanup_result
+    if mask_tif_dir.is_symlink():
+        logger.warning('变化检测 mask TIFF 目录是符号链接，为避免误删已跳过: %s', mask_tif_dir)
+        return cleanup_result
+
+    try:
+        tif_candidates = sorted(mask_tif_dir.iterdir())
+    except OSError as cleanup_error:
+        cleanup_result['failed_files'].append({
+            'file': str(mask_tif_dir),
+            'error': str(cleanup_error),
+        })
+        logger.warning('无法读取变化检测中间 mask TIFF 目录 %s: %s', mask_tif_dir, cleanup_error)
+        return cleanup_result
+
+    for tif_path in tif_candidates:
+        if not tif_path.is_file() or tif_path.suffix.lower() not in ('.tif', '.tiff'):
+            continue
+        try:
+            tif_path.unlink()
+            cleanup_result['removed_count'] += 1
+        except OSError as cleanup_error:
+            cleanup_result['failed_files'].append({
+                'file': str(tif_path),
+                'error': str(cleanup_error),
+            })
+            logger.warning('清理变化检测中间 mask TIFF 失败 %s: %s', tif_path, cleanup_error)
+
+    # 目录为空时一并移除；若有非 TIFF 文件或删除失败则保留，便于排查。
+    try:
+        mask_tif_dir.rmdir()
+    except OSError:
+        pass
+
+    logger.info(
+        '变化检测中间 mask TIFF 清理完成: 删除 %s 个，失败 %s 个，目录=%s',
+        cleanup_result['removed_count'],
+        len(cleanup_result['failed_files']),
+        mask_tif_dir,
+    )
+    return cleanup_result
+
+
 def _write_empty_classification_shp(output_shp, crs):
     """创建带稳定字段的 UTF-8 空结果，确保无变化时仍有可用输出。"""
     from osgeo import ogr, osr
@@ -855,6 +917,17 @@ def classification_folder(pre_folder, post_folder, mask_folder, model_path, dst_
         if not merged_shp or not os.path.exists(merged_shp):
             raise RuntimeError('合并分类结果后未生成有效 SHP')
 
+    # 最终分类 SHP 已确认有效，此时变化检测的中间 mask TIFF 已无后续用途。
+    prg_sender.send({
+        'progress': 96,
+        'runningStatus': 'running',
+        'runningInfo': '最终分类结果已合并，正在清理变化检测临时 mask TIFF',
+    })
+    mask_tif_cleanup = _cleanup_change_mask_tifs(mask_folder, logger)
+    swap_write('removed_mask_tif_count', mask_tif_cleanup['removed_count'])
+    if mask_tif_cleanup['failed_files']:
+        swap_write('mask_tif_cleanup_warnings', mask_tif_cleanup['failed_files'])
+
     # 9. 输出 Swap 变量
     result_shp = merged_shp if merged_shp else shp_dir
     swap_write('output_shp', result_shp)
@@ -892,6 +965,7 @@ def classification_folder(pre_folder, post_folder, mask_folder, model_path, dst_
         'failed_results': failed_list,
         'mask_feature_counts': feature_counts,
         'output_shp': result_shp,
+        'mask_tif_cleanup': mask_tif_cleanup,
     })
 
     # 11. 单组数据失败按告警处理，不中断整个批量工作流。
