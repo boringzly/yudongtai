@@ -67,15 +67,49 @@ def _available_cpu_count():
     return max(1, min(counts))
 
 
+def _running_under_hami():
+    """识别 HAMi/vGPU 注入环境，用于采用更保守的 CPU worker 数量。"""
+    preload = os.environ.get('LD_PRELOAD', '').lower()
+    if 'libvgpu' in preload or 'hami' in preload:
+        return True
+    hami_markers = (
+        'CUDA_DEVICE_MEMORY_LIMIT',
+        'CUDA_DEVICE_SM_LIMIT',
+        'CUDA_DEVICE_MEMORY_SHARED_CACHE',
+        'HAMI_VISIBLE_DEVICES',
+    )
+    if any(os.environ.get(marker) not in (None, '') for marker in hami_markers):
+        return True
+    return os.path.exists('/tmp/cudevshr.cache')
+
+
 def _recommended_dataloader_workers():
-    """按并行影像任务数均分约 80% 的容器 CPU，给主进程和 GDAL 留出余量。"""
+    """按 CPU 配额分配 worker；HAMi 下限制进程数以降低共享锁竞争。"""
+    configured = os.environ.get('CHANGE_DETECTION_DATA_WORKERS')
+    if configured not in (None, ''):
+        try:
+            return max(0, min(48, int(configured)))
+        except (TypeError, ValueError):
+            pass
+
     available_cpus = _available_cpu_count()
     try:
         parallel_jobs = max(1, int(os.environ.get('CHANGE_DETECTION_PARALLEL_JOBS', '1')))
     except (TypeError, ValueError):
         parallel_jobs = 1
     workers_per_job = int(available_cpus * 0.8) // parallel_jobs
+    if _running_under_hami():
+        workers_per_job = min(workers_per_job, 8)
     return max(1, min(48, workers_per_job))
+
+
+def _init_change_dataloader_worker(_worker_id):
+    """DataLoader 子进程只做 CPU/GDAL/FFT，禁止其初始化 CUDA/HAMi。"""
+    os.environ['CUDA_VISIBLE_DEVICES'] = ''
+    os.environ['OMP_NUM_THREADS'] = '1'
+    os.environ['MKL_NUM_THREADS'] = '1'
+    os.environ['OPENBLAS_NUM_THREADS'] = '1'
+    torch.set_num_threads(1)
 
 def CalHistogram(img):
     
@@ -488,6 +522,13 @@ class OnlineDataset(data.Dataset):
             normalize
         ])
 
+    def __getstate__(self):
+        """spawn 模式不继承任何已打开的 GDAL dataset。"""
+        state = self.__dict__.copy()
+        state['predataset'] = {}
+        state['postdataset'] = {}
+        return state
+
     def __getitem__(self, index):
         # 根据计算好索引列表读取对应区域的影像切片（前时相）
         clip_x, clip_y, pad_x_right, pad_y_down = self.index_list[index]
@@ -778,7 +819,7 @@ def _resolve_checkpoint_path(module_dir, requested_path, fallback_filename, mode
 
 def test_lib_big_memeff(pre_img_path='', post_img_path='', output_path='', logger=None, callback_url=None, job_id=None,
                         temp_dir_suffix="tmp", progress_callback=None, model_path=None,
-                        use_two_models=False, second_model_path=None):
+                        use_two_models=False, second_model_path=None, dataloader_workers=None):
     """
     主要的推理函数
 
@@ -875,9 +916,13 @@ def test_lib_big_memeff(pre_img_path='', post_img_path='', output_path='', logge
         'MODEL_NUM_CLASSES': 1,
         # 每个影像进程固定使用一张 GPU；不同影像由外层进程并行调度。
         'TEST_BATCHES': 1,
-        # 根据 Pod CPU 配额和并行影像数均分约 80%：60 CPU、双卡并行约每卡 24。
+        # 根据 Pod CPU 配额和并行影像数均分约 80%；HAMi 环境默认每卡最多 8 个，
         # 其余 CPU 留给主进程、GPU 喂数、GDAL 写出和消息线程。
-        'TEST_NUM_WORKERS': _recommended_dataloader_workers(),
+        'TEST_NUM_WORKERS': (
+            _recommended_dataloader_workers()
+            if dataloader_workers is None
+            else max(0, min(48, int(dataloader_workers)))
+        ),
         'TEST_PREFETCH_FACTOR': 1,
         'WITH_TTA': False,
         'with_fft': True,
@@ -1143,22 +1188,34 @@ def test_lib(local_rank, gpu_count, cfg, logger, progress_callback=None):
         #import ipdb;ipdb.set_trace()
         # test_dataloader
         test_data = OnlineDataset(path_info, cfg.BAND_NUM, cfg.with_fft)
+        loader_mode = 'single-process'
+        if cfg.TEST_NUM_WORKERS > 0:
+            loader_mode = 'spawn'
         if logger is not None:
             logger.info(
-                'DataLoader配置: batch_size=%s, num_workers=%s, prefetch_factor=%s',
+                'DataLoader配置: batch_size=%s, num_workers=%s, prefetch_factor=%s, '
+                'start_method=%s, persistent_workers=false, hami=%s',
                 cfg.TEST_BATCHES,
                 cfg.TEST_NUM_WORKERS,
                 cfg.TEST_PREFETCH_FACTOR,
+                loader_mode,
+                _running_under_hami(),
             )
-        data_loader_test = torch.utils.data.DataLoader(
-            test_data,
-            batch_size=cfg.TEST_BATCHES,
-            shuffle=False,
-            num_workers=cfg.TEST_NUM_WORKERS,
-            pin_memory=gpu_count > 0,
-            prefetch_factor=cfg.TEST_PREFETCH_FACTOR,
-            persistent_workers=cfg.TEST_NUM_WORKERS > 0,
-        )
+        dataloader_kwargs = {
+            'batch_size': cfg.TEST_BATCHES,
+            'shuffle': False,
+            'num_workers': cfg.TEST_NUM_WORKERS,
+            'pin_memory': gpu_count > 0,
+        }
+        if cfg.TEST_NUM_WORKERS > 0:
+            dataloader_kwargs.update({
+                'prefetch_factor': cfg.TEST_PREFETCH_FACTOR,
+                # 外层 GPU 进程已经初始化 CUDA/HAMi，不能再 fork 数据进程继承其锁状态。
+                'multiprocessing_context': 'spawn',
+                'persistent_workers': False,
+                'worker_init_fn': _init_change_dataloader_worker,
+            })
+        data_loader_test = torch.utils.data.DataLoader(test_data, **dataloader_kwargs)
         # create result file
 
         driver = gdal.GetDriverByName('GTiff')

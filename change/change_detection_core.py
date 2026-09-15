@@ -318,6 +318,11 @@ def _detect_change_gpu_count():
     return detected
 
 
+def _is_dataloader_worker_failure(error):
+    message = str(error).lower()
+    return 'dataloader worker' in message and 'exited unexpectedly' in message
+
+
 def _change_pair_worker(task_queue, event_queue, staging_lock, gpu_slot, parallel_jobs):
     """一个进程独占一张 GPU，持续领取影像对执行推理。"""
     if gpu_slot is None:
@@ -443,19 +448,53 @@ def _process_change_pair(task, event_queue, staging_lock, worker_label):
                 'estimated_tif_size': estimated_tif_size,
             })
 
-        test_lib_big_memeff(
-            pre_img_path=run_pre_path,
-            post_img_path=run_post_path,
-            output_path=run_output_shp,
-            logger=logger,
-            callback_url=None,
-            job_id=None,
-            temp_dir_suffix=f'tmp_{idx}_{os.getpid()}',
-            progress_callback=_progress_callback,
-            model_path=task['model_path'],
-            use_two_models=task['use_two_models'],
-            second_model_path=task['second_model_path'],
-        )
+        temp_dir_suffix = f'tmp_{idx}_{os.getpid()}'
+
+        def _run_inference(dataloader_workers=None, retry=False):
+            test_lib_big_memeff(
+                pre_img_path=run_pre_path,
+                post_img_path=run_post_path,
+                output_path=run_output_shp,
+                logger=logger,
+                callback_url=None,
+                job_id=None,
+                temp_dir_suffix=(temp_dir_suffix + '_retry') if retry else temp_dir_suffix,
+                progress_callback=_progress_callback,
+                model_path=task['model_path'],
+                use_two_models=task['use_two_models'],
+                second_model_path=task['second_model_path'],
+                dataloader_workers=dataloader_workers,
+            )
+
+        try:
+            _run_inference()
+        except RuntimeError as inference_error:
+            if not _is_dataloader_worker_failure(inference_error):
+                raise
+
+            logger.warning(
+                'DataLoader worker 异常退出，清理本次未完成输出并以 num_workers=0 重试: %s',
+                inference_error,
+            )
+            event_queue.put({
+                'type': 'retry',
+                'idx': idx,
+                'stem': stem,
+                'worker': worker_label,
+                'reason': str(inference_error),
+            })
+            _remove_shapefile_dataset(run_output_shp)
+            _remove_file_if_exists(active_tif_path)
+            shutil.rmtree(
+                os.path.join(os.path.dirname(run_output_shp), temp_dir_suffix),
+                ignore_errors=True,
+            )
+            import gc
+            import torch
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            _run_inference(dataloader_workers=0, retry=True)
         if not os.path.exists(run_output_shp):
             raise NonFatalTaskWarning(f'变化检测未生成结果文件: {run_output_shp}')
 
@@ -779,6 +818,24 @@ def change_detection_folder(pre_folder, post_folder, model_path, dst_path, outpu
                     'progress': overall_progress,
                     'runningStatus': 'running',
                     'runningInfo': running_info,
+                })
+                continue
+
+            if event_type == 'retry':
+                logger.warning(
+                    '%s 正在以单进程数据加载重试 (%s/%s) %s: %s',
+                    worker_label,
+                    idx + 1,
+                    total,
+                    stem,
+                    event.get('reason'),
+                )
+                prg_sender.send({
+                    'progress': prg_sender.calc_progress_value(
+                        sum(pair_progress.values()), total, 5, 95
+                    ),
+                    'runningStatus': 'running',
+                    'runningInfo': f'{worker_label} 数据加载异常，正在安全重试 ({idx+1}/{total}): {stem}',
                 })
                 continue
 

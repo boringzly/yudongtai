@@ -595,22 +595,52 @@ class MultiGpuInferenceTests(unittest.TestCase):
         self.assertIn("valid_nodata_mask = nodata_mask[non_zero_mask]", source)
         self.assertIn("valid_indexs = [component[non_zero_mask] for component in indexs]", source)
 
-    def test_change_detection_scales_to_48_workers_for_60_cpu(self):
+    def test_change_detection_workers_are_hami_safe_and_configurable(self):
         source_path = ROOT / "change" / "test_lib_batch_memeff_single_image_nomp.py"
         tree = ast.parse(source_path.read_text(encoding="utf-8"))
-        worker_function = next(
+        worker_functions = [
             node for node in tree.body
-            if isinstance(node, ast.FunctionDef) and node.name == "_recommended_dataloader_workers"
+            if isinstance(node, ast.FunctionDef)
+            and node.name in {"_running_under_hami", "_recommended_dataloader_workers"}
+        ]
+        fake_os = types.SimpleNamespace(
+            environ={},
+            path=types.SimpleNamespace(exists=lambda _path: False),
         )
-        fake_os = types.SimpleNamespace(environ={})
         namespace = {"_available_cpu_count": lambda: 60, "os": fake_os}
         exec(
-            compile(ast.Module(body=[worker_function], type_ignores=[]), str(source_path), "exec"),
+            compile(ast.Module(body=worker_functions, type_ignores=[]), str(source_path), "exec"),
             namespace,
         )
         self.assertEqual(namespace["_recommended_dataloader_workers"](), 48)
         fake_os.environ["CHANGE_DETECTION_PARALLEL_JOBS"] = "2"
         self.assertEqual(namespace["_recommended_dataloader_workers"](), 24)
+        fake_os.environ["LD_PRELOAD"] = "/usr/local/vgpu/libvgpu.so"
+        self.assertEqual(namespace["_recommended_dataloader_workers"](), 8)
+        fake_os.environ["CHANGE_DETECTION_DATA_WORKERS"] = "4"
+        self.assertEqual(namespace["_recommended_dataloader_workers"](), 4)
+        fake_os.environ["CHANGE_DETECTION_DATA_WORKERS"] = "0"
+        self.assertEqual(namespace["_recommended_dataloader_workers"](), 0)
+
+    def test_change_detection_dataloader_avoids_hami_fork_and_retries_safely(self):
+        inference_source = (
+            ROOT / "change" / "test_lib_batch_memeff_single_image_nomp.py"
+        ).read_text(encoding="utf-8")
+        batch_source = (ROOT / "change" / "change_detection_core.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("'multiprocessing_context': 'spawn'", inference_source)
+        self.assertIn("'persistent_workers': False", inference_source)
+        self.assertIn("'worker_init_fn': _init_change_dataloader_worker", inference_source)
+        self.assertIn("dataloader_workers=0, retry=True", batch_source)
+        self.assertIn("if not _is_dataloader_worker_failure(inference_error):", batch_source)
+
+    def test_classification_dataloader_also_avoids_hami_fork(self):
+        source = (
+            ROOT / "fenlei" / "clie_new" / "CLInferEngine" / "clie_lib" / "run_lib.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("'multiprocessing_context': 'spawn'", source)
+        self.assertIn("'persistent_workers': False", source)
 
     def test_classification_handles_zero_one_and_multiple_visible_gpus(self):
         source_path = (

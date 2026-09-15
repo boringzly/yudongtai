@@ -775,7 +775,10 @@ def infer(kwargs):
         if data_workers > 0:
             dataloader_kwargs.update({
                 'prefetch_factor': 1,
-                'persistent_workers': True,
+                # 模型已初始化 CUDA/HAMi，使用 spawn 避免 fork 继承共享锁状态。
+                'multiprocessing_context': 'spawn',
+                # 每张影像都会重建 DataLoader，持久 worker 没有复用收益且会延迟进程退出。
+                'persistent_workers': False,
                 'worker_init_fn': reopen_infer_data_worker,
             })
         test_dataloader = DataLoader(test_data, **dataloader_kwargs)
