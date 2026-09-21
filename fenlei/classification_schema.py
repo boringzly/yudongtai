@@ -10,7 +10,7 @@ CLASS_NAME_BY_CODE = {
     6: "未利用土地",
 }
 
-OUTPUT_FIELDS = ["uid", "pre_code", "pre_name", "curr_code", "curr_name", "geometry"]
+OUTPUT_FIELDS = ["uid", "pre_code", "pre_name", "curr_code", "curr_name", "province", "geometry"]
 
 
 def get_class_name(code):
@@ -38,5 +38,8 @@ def format_classification_result(gdf):
     result["curr_code"] = result["curr_code"].fillna(0).astype("int32")
     result["pre_name"] = result["pre_code"].map(get_class_name).astype("object")
     result["curr_name"] = result["curr_code"].map(get_class_name).astype("object")
+    if "province" not in result.columns:
+        result["province"] = "未知"
+    result["province"] = result["province"].fillna("未知").astype("object")
 
     return result[OUTPUT_FIELDS]

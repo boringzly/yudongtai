@@ -109,9 +109,38 @@ class ClassificationSchemaTests(unittest.TestCase):
     def test_output_fields_are_shapefile_safe(self):
         self.assertEqual(
             self.schema.OUTPUT_FIELDS,
-            ["uid", "pre_code", "pre_name", "curr_code", "curr_name", "geometry"],
+            ["uid", "pre_code", "pre_name", "curr_code", "curr_name", "province", "geometry"],
         )
         self.assertTrue(all(len(name) <= 10 for name in self.schema.OUTPUT_FIELDS[:-1]))
+
+    def test_province_field_defaults_to_unknown(self):
+        source = (ROOT / "fenlei" / "classification_schema.py").read_text(encoding="utf-8")
+        self.assertIn('result["province"] = "未知"', source)
+
+
+class ProvinceAttributionTests(unittest.TestCase):
+    def test_province_resource_contains_all_provincial_regions(self):
+        resource_path = ROOT / "fenlei" / "assets" / "china_provinces.geojson"
+        payload = json.loads(resource_path.read_text(encoding="utf-8"))
+        province_names = {
+            feature["properties"]["name"]
+            for feature in payload["features"]
+            if feature["properties"].get("gb")
+            and "Polygon" in feature["geometry"]["type"]
+        }
+        self.assertEqual(len(province_names), 34)
+        self.assertIn("北京市", province_names)
+        self.assertIn("新疆维吾尔自治区", province_names)
+        self.assertIn("香港特别行政区", province_names)
+
+    def test_single_and_batch_results_receive_province_names(self):
+        source = (ROOT / "fenlei" / "classification_core.py").read_text(encoding="utf-8")
+        self.assertGreaterEqual(source.count("assign_province_names("), 3)
+        merge_position = source.index("merged_shp = merge_shp(output_shp_list, merged_shp)")
+        province_position = source.index("assign_province_names(merged_shp", merge_position)
+        cleanup_position = source.index("mask_tif_cleanup = _cleanup_change_mask_tifs", province_position)
+        self.assertLess(merge_position, province_position)
+        self.assertLess(province_position, cleanup_position)
 
 
 class ProgressMessageSenderTests(unittest.TestCase):

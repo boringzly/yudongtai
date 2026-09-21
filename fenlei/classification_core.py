@@ -388,6 +388,7 @@ def _write_empty_classification_shp(output_shp, crs):
         ('pre_name', ogr.OFTString, 32),
         ('curr_code', ogr.OFTInteger, None),
         ('curr_name', ogr.OFTString, 32),
+        ('province', ogr.OFTString, 40),
     )
     for name, field_type, width in field_specs:
         field = ogr.FieldDefn(name, field_type)
@@ -403,6 +404,7 @@ def _write_empty_classification_shp(output_shp, crs):
 
 from DatasetBuilder import DatasetBuilder
 from classification_schema import format_classification_result
+from province_attribution import assign_province_names
 
 # ========== 算法主体 ==========
 
@@ -472,6 +474,8 @@ def classification(pre_image, post_image, mask_shp, model_path, dst_path, output
     if len(gdf) == 0:
         logger.info("mask为空，没有变化区域可分类；空 SHP 是有效的无变化结果")
         _write_empty_classification_shp(out_shp_file, gdf.crs)
+        province_result = assign_province_names(out_shp_file, logger=logger)
+        swap_write('province_assignment', province_result)
         swap_write('output_shp', out_shp_file)
         swap_write('classified_count', 0)
         if output_dataset is not None:
@@ -624,9 +628,12 @@ def classification(pre_image, post_image, mask_shp, model_path, dst_path, output
     gdf = format_classification_result(gdf)
     os.makedirs(dst_path, exist_ok=True)
     gdf.to_file(out_shp_file, encoding="utf-8")
+    prg_sender.send({'progress': 95, 'runningStatus': 'running', 'runningInfo': '正在为图斑匹配省名称'})
+    province_result = assign_province_names(out_shp_file, logger=logger)
 
     swap_write('output_shp', out_shp_file)
     swap_write('classified_count', len(gdf))
+    swap_write('province_assignment', province_result)
 
     # 10. 输出 Dataset
     prg_sender.send({'progress': 99, 'runningStatus': 'running', 'runningInfo': '创建输出数据集'})
@@ -916,6 +923,13 @@ def classification_folder(pre_folder, post_folder, mask_folder, model_path, dst_
         merged_shp = merge_shp(output_shp_list, merged_shp)
         if not merged_shp or not os.path.exists(merged_shp):
             raise RuntimeError('合并分类结果后未生成有效 SHP')
+        prg_sender.send({
+            'progress': 95,
+            'runningStatus': 'running',
+            'runningInfo': '分类结果已合并，正在为图斑匹配省名称',
+        })
+        province_result = assign_province_names(merged_shp, logger=logger)
+        swap_write('province_assignment', province_result)
 
     # 最终分类 SHP 已确认有效，此时变化检测的中间 mask TIFF 已无后续用途。
     prg_sender.send({
