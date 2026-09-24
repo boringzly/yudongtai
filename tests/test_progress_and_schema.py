@@ -118,6 +118,83 @@ class ClassificationSchemaTests(unittest.TestCase):
         self.assertIn('result["province"] = "未知"', source)
 
 
+class ClassificationMajorityTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # 仅加载统计函数，使这些回归测试不依赖 GPU / GDAL 等部署环境。
+        source_path = ROOT / "fenlei" / "classification_core.py"
+        tree = ast.parse(source_path.read_text(encoding="utf-8"))
+        function_names = {"_map_class_code", "_major_class_from_counts", "_process_chunk"}
+        functions = [
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name in function_names
+        ]
+        cls.functions = {}
+        exec(
+            compile(ast.Module(body=functions, type_ignores=[]), str(source_path), "exec"),
+            cls.functions,
+        )
+
+    def test_building_subclasses_together_outvote_water(self):
+        counts = {6: 25, 7: 20, 8: 10, 9: 5, 11: 40}
+        self.assertEqual(self.functions["_major_class_from_counts"](counts), 5)
+
+    def test_other_merged_classes_also_sum_their_subclasses(self):
+        cases = [
+            ({1: 30, 2: 25, 11: 45}, 1),
+            ({3: 30, 4: 25, 11: 45}, 2),
+            ({10: 20, 12: 20, 13: 15, 11: 45}, 6),
+        ]
+        for counts, expected in cases:
+            with self.subTest(counts=counts):
+                self.assertEqual(self.functions["_major_class_from_counts"](counts), expected)
+
+    def test_water_still_wins_when_its_total_is_largest(self):
+        self.assertEqual(
+            self.functions["_major_class_from_counts"]({6: 20, 7: 15, 9: 10, 11: 55}), 4
+        )
+
+    def test_empty_or_only_unclassified_pixels_are_unknown(self):
+        for counts in (None, {}, {0: 100}, {14: 100, 255: 50}, {6: 0, 11: 0}):
+            with self.subTest(counts=counts):
+                self.assertEqual(self.functions["_major_class_from_counts"](counts), 0)
+
+    def test_unclassified_pixels_do_not_outvote_valid_classes(self):
+        self.assertEqual(
+            self.functions["_major_class_from_counts"]({0: 900, 255: 100, 7: 5}), 5
+        )
+
+    def test_ties_are_deterministic_regardless_of_dictionary_order(self):
+        counts = {6: 20, 7: 30, 11: 50}
+        select = self.functions["_major_class_from_counts"]
+        self.assertEqual(select(counts), 4)
+        self.assertEqual(select(dict(reversed(list(counts.items())))), 4)
+
+    def test_shared_chunk_path_uses_merged_counts_and_original_geometries(self):
+        chunk = types.SimpleNamespace(index=[17, 4, 31])
+        pixels, affine = object(), object()
+        source = mock.MagicMock()
+        source.__enter__.return_value = source
+        source.read.return_value = pixels
+        source.transform = affine
+        rasterio = types.ModuleType("rasterio")
+        rasterio.open = mock.Mock(return_value=source)
+        rasterstats = types.ModuleType("rasterstats")
+        rasterstats.zonal_stats = mock.Mock(return_value=[
+            {6: 25, 7: 20, 8: 15, 11: 40},
+            {11: 60, 7: 40},
+            {},
+        ])
+        with mock.patch.dict(sys.modules, {"rasterio": rasterio, "rasterstats": rasterstats}):
+            indices, classes = self.functions["_process_chunk"]((chunk, "classification.tif"))
+        self.assertEqual(indices, [17, 4, 31])
+        self.assertEqual(classes, [5, 4, 0])
+        source.read.assert_called_once_with(1)
+        rasterstats.zonal_stats.assert_called_once_with(
+            chunk, pixels, affine=affine, categorical=True, nodata=0, all_touched=False,
+        )
+
+
 class ProvinceAttributionTests(unittest.TestCase):
     def test_province_resource_contains_all_provincial_regions(self):
         resource_path = ROOT / "fenlei" / "assets" / "china_provinces.geojson"
@@ -520,12 +597,6 @@ class EntryProgressTests(unittest.TestCase):
         merge_position = source.index("merged_shp = merge_shp(output_shp_list, merged_shp)")
         cleanup_position = source.index("mask_tif_cleanup = _cleanup_change_mask_tifs(mask_folder, logger)")
         self.assertGreater(cleanup_position, merge_position)
-
-    def test_empty_zonal_stats_map_to_unknown(self):
-        source = (ROOT / "fenlei" / "classification_core.py").read_text(encoding="utf-8")
-        self.assertIn("major_classes.append(0)", source)
-        self.assertNotIn("major_classes.append(5)", source)
-
 
 class ShapefileMergeTests(unittest.TestCase):
     def test_merge_handles_empty_inputs_crs_and_utf8(self):

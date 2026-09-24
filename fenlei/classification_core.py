@@ -418,6 +418,21 @@ def _map_class_code(original_code):
     return label_mapping.get(original_code, 0)
 
 
+def _major_class_from_counts(pixel_counts):
+    """先合并六大类像元数再取众数；无有效像元返回 0，并列时取较小编号。"""
+    class_counts = {}
+    for original_code, count in (pixel_counts or {}).items():
+        class_code = _map_class_code(original_code)
+        # 未分类、未知编号和零计数不参与六大类投票。
+        if class_code == 0 or count <= 0:
+            continue
+        class_counts[class_code] = class_counts.get(class_code, 0) + count
+
+    if not class_counts:
+        return 0
+    return max(class_counts, key=lambda code: (class_counts[code], -code))
+
+
 def _process_chunk(args):
     import rasterio
     from rasterstats import zonal_stats
@@ -426,15 +441,13 @@ def _process_chunk(args):
     with rasterio.open(tif_file) as src:
         raster_data = src.read(1)
         affine = src.transform
-        stats = zonal_stats(gdf_chunk, raster_data, affine=affine, categorical=True, nodata=0)
-    major_classes = []
-    for stat in stats:
-        if stat:
-            original_major_class = max(stat, key=stat.get)
-            mapped_class = _map_class_code(original_major_class)
-            major_classes.append(mapped_class)
-        else:
-            major_classes.append(0)
+        # 按真实图斑几何掩膜统计；外接矩形仅用于栅格窗口读取。
+        # 保持像元中心落入图斑的采样规则，避免细长道路纳入过多周边像元。
+        stats = zonal_stats(
+            gdf_chunk, raster_data, affine=affine,
+            categorical=True, nodata=0, all_touched=False,
+        )
+    major_classes = [_major_class_from_counts(stat) for stat in stats]
     return list(gdf_chunk.index), major_classes
 
 
