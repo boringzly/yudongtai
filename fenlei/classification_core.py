@@ -19,19 +19,16 @@ prg_sender = None
 
 
 def _ensure_log_dir(dst_path):
-    resolved_dst = Path(dst_path).resolve()
-    task_root = resolved_dst
-    for candidate in (resolved_dst, *resolved_dst.parents):
-        if candidate.name.lower() == 'working':
-            task_root = candidate.parent
-            break
-    log_dir = task_root / 'logs'
-    log_dir.mkdir(parents=True, exist_ok=True)
-    return str(log_dir)
+    # Share exactly the same path rule as change detection and its GPU workers.
+    repo_root = str(Path(__file__).resolve().parents[1])
+    if repo_root not in sys.path:
+        sys.path.append(repo_root)
+    from task_artifacts import ensure_log_dir
+    return ensure_log_dir(dst_path)
 
 
 def _configure_persistent_logger(name, dst_path, filename='classification.log'):
-    """同时写 stdout 和任务输出目录，Pod 退出后仍可追溯。"""
+    """同时写 stdout 和独立诊断目录，不污染入库输出，Pod 退出后仍可追溯。"""
     log_path = os.path.join(_ensure_log_dir(dst_path), filename)
     logger = logging.getLogger(name)
     logger.setLevel(logging.INFO)
@@ -418,6 +415,26 @@ def _map_class_code(original_code):
     return label_mapping.get(original_code, 0)
 
 
+def _generate_result_previews(sources, dst_path, logger):
+    """Optional bounded QA output, alongside logs; keep failures out of the workflow."""
+    try:
+        from result_previews import generate_previews
+        preview_root = str(Path(_ensure_log_dir(dst_path)).parent)
+        result = generate_previews(
+            sources, preview_root, {code: _map_class_code(code) for code in range(14)}, logger,
+            progress=lambda message: prg_sender.send({
+                'progress': 98, 'runningStatus': 'running', 'runningInfo': message,
+            }),
+        )
+        swap_write('preview_count', len(result['samples']))
+        if result.get('index'):
+            swap_write('preview_index', result['index'])
+        return result
+    except Exception as exc:
+        logger.warning('生成抽样预览失败，SHP 结果不受影响: %s', exc, exc_info=True)
+        return {'status': 'failed', 'warnings': [str(exc)]}
+
+
 def _major_class_from_counts(pixel_counts):
     """先合并六大类像元数再取众数；无有效像元返回 0，并列时取较小编号。"""
     class_counts = {}
@@ -491,6 +508,7 @@ def classification(pre_image, post_image, mask_shp, model_path, dst_path, output
         swap_write('province_assignment', province_result)
         swap_write('output_shp', out_shp_file)
         swap_write('classified_count', 0)
+        preview_result = _generate_result_previews([], dst_path, logger)
         if output_dataset is not None:
             ds = DatasetBuilder(output_dataset)
             ds.add("result", dst_path, "vector", [Path(out_shp_file).name])
@@ -504,6 +522,7 @@ def classification(pre_image, post_image, mask_shp, model_path, dst_path, output
             'feature_count': 0,
             'empty_result': True,
             'reason': '变化检测结果不包含变化图斑',
+            'previews': preview_result,
         })
         _send_completed('无变化区域可分类')
         return
@@ -648,6 +667,12 @@ def classification(pre_image, post_image, mask_shp, model_path, dst_path, output
     swap_write('classified_count', len(gdf))
     swap_write('province_assignment', province_result)
 
+    # Read sampled windows before the temporary single-image class TIFFs are removed.
+    preview_result = _generate_result_previews([{
+        'shp': out_shp_file, 'pre_image': pre_image, 'post_image': post_image,
+        'pre_class': tif_file1, 'post_class': tif_file2,
+    }], dst_path, logger)
+
     # 10. 输出 Dataset
     prg_sender.send({'progress': 99, 'runningStatus': 'running', 'runningInfo': '创建输出数据集'})
 
@@ -665,6 +690,7 @@ def classification(pre_image, post_image, mask_shp, model_path, dst_path, output
         'output_shp': out_shp_file,
         'feature_count': len(gdf),
         'empty_result': len(gdf) == 0,
+        'previews': preview_result,
     })
 
     # 11. 报告完成
@@ -764,6 +790,7 @@ def classification_folder(pre_folder, post_folder, mask_folder, model_path, dst_
     # Kafka 连接参数已在父进程环境中，通过 os.environ.copy() 继承
 
     output_shp_list = []
+    preview_sources = []
     failed_list = []
     empty_result_list = []
     feature_counts = {}
@@ -899,6 +926,12 @@ def classification_folder(pre_folder, post_folder, mask_folder, model_path, dst_
 
             logger.info(f'  处理完成，结果保存至：{output_shp}')
             output_shp_list.append(output_shp)
+            # Final merge preserves these geometries and pre/curr class codes.
+            # Retain the matching source pair: uid is not globally unique after merging.
+            preview_sources.append({
+                'shp': output_shp, 'pre_image': str(pre_file), 'post_image': str(post_file),
+                'pre_class': tif_file1, 'post_class': tif_file2,
+            })
 
         except Exception as e:
             logger.exception('处理 %s 失败，已跳过: %s', stem, e)
@@ -962,6 +995,7 @@ def classification_folder(pre_folder, post_folder, mask_folder, model_path, dst_
     swap_write('output_shp_list', output_shp_list)
     swap_write('merged_shp', merged_shp)
     swap_write('processed_count', len(output_shp_list))
+    preview_result = _generate_result_previews(preview_sources, dst_path, logger)
     # 10. 输出 Dataset
     prg_sender.send({'progress': 99, 'runningStatus': 'running', 'runningInfo': '创建输出数据集'})
 
@@ -993,6 +1027,7 @@ def classification_folder(pre_folder, post_folder, mask_folder, model_path, dst_
         'mask_feature_counts': feature_counts,
         'output_shp': result_shp,
         'mask_tif_cleanup': mask_tif_cleanup,
+        'previews': preview_result,
     })
 
     # 11. 单组数据失败按告警处理，不中断整个批量工作流。

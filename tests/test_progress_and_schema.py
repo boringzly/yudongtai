@@ -904,6 +904,7 @@ class DualModelWorkflowTests(unittest.TestCase):
 class PersistentDiagnosticsTests(unittest.TestCase):
     @staticmethod
     def _load_functions(source_path, function_names, namespace):
+        namespace.update({'__file__': str(source_path), 'sys': sys})
         tree = ast.parse(source_path.read_text(encoding="utf-8"))
         functions = [
             node for node in tree.body
@@ -915,7 +916,7 @@ class PersistentDiagnosticsTests(unittest.TestCase):
         )
         return namespace
 
-    def test_logs_are_persisted_above_working_directory(self):
+    def test_logs_are_persisted_outside_task_output_directory(self):
         source_path = ROOT / "change" / "change_detection_core.py"
         namespace = {"os": os, "Path": Path, "logging": __import__("logging")}
         self._load_functions(
@@ -933,7 +934,7 @@ class PersistentDiagnosticsTests(unittest.TestCase):
             logger.error("diagnostic-line")
             for handler in logger.handlers:
                 handler.flush()
-            self.assertEqual(Path(log_path).parent, task_root / "logs")
+            self.assertEqual(Path(log_path).parent, Path(temp_dir) / 'task_diagnostics' / 'task-1' / 'logs')
             self.assertIn("diagnostic-line", Path(log_path).read_text(encoding="utf-8"))
             for handler in list(logger.handlers):
                 logger.removeHandler(handler)
@@ -955,7 +956,7 @@ class PersistentDiagnosticsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             logger, log_path = namespace["_configure_persistent_logger"](
                 "classification_subprocess_test",
-                temp_dir,
+                Path(temp_dir) / 'task-1',
             )
             namespace["_run_subprocess_logged"](
                 [sys.executable, "-c", "print('child-diagnostic')"],

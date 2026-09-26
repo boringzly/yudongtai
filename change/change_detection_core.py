@@ -20,19 +20,16 @@ prg_sender = None
 
 
 def _ensure_log_dir(dst_path):
-    resolved_dst = Path(dst_path).resolve()
-    task_root = resolved_dst
-    for candidate in (resolved_dst, *resolved_dst.parents):
-        if candidate.name.lower() == 'working':
-            task_root = candidate.parent
-            break
-    log_dir = task_root / 'logs'
-    log_dir.mkdir(parents=True, exist_ok=True)
-    return str(log_dir)
+    # The launcher runs this step with change/ as cwd, including spawned workers.
+    repo_root = str(Path(__file__).resolve().parents[1])
+    if repo_root not in sys.path:
+        sys.path.append(repo_root)
+    from task_artifacts import ensure_log_dir
+    return ensure_log_dir(dst_path)
 
 
 def _configure_persistent_logger(name, dst_path, filename='change_detection.log'):
-    """同时写 stdout 和任务输出目录，Pod 退出后仍可追溯。"""
+    """同时写 stdout 和独立诊断目录，不污染入库输出，Pod 退出后仍可追溯。"""
     log_path = os.path.join(_ensure_log_dir(dst_path), filename)
     logger = logging.getLogger(name)
     logger.setLevel(logging.INFO)
