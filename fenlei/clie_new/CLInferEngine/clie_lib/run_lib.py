@@ -110,6 +110,51 @@ def _classification_batch_per_gpu():
     except (TypeError, ValueError):
         return 8
 
+
+def _classification_downsample_factor():
+    """Default to half-resolution inference; 1 permits comparison with legacy inference."""
+    configured = os.environ.get('CLIE_INFER_DOWNSAMPLE', '2')
+    try:
+        factor = int(configured)
+    except (TypeError, ValueError):
+        factor = 2
+    return factor if factor in (1, 2) else 2
+
+
+def _inference_input_size(height, width, factor, upsample=False):
+    multiplier = 2 if upsample else 1
+    return max(1, height * multiplier // factor), max(1, width * multiplier // factor)
+
+
+def _configure_inference_downsample(config, log):
+    factor = _classification_downsample_factor()
+    if factor > 1:
+        if config.UPSAMPLE:
+            log.info('分类两倍下采样已启用，关闭权重/配置中的 UPSAMPLE，避免先放大再缩小相互抵消')
+        config.UPSAMPLE = False
+    infer_height, infer_width = _inference_input_size(config.IMG_SIZE, config.IMG_SIZE, factor, config.UPSAMPLE)
+    log.info('分类切片推理: 原切片=%sx%s, 模型输入=%sx%s, 下采样倍数=%s, UPSAMPLE=%s；'
+             '预测类别图最近邻恢复原切片尺寸后应用掩膜并写出' % (
+                 config.IMG_SIZE, config.IMG_SIZE, infer_height, infer_width, factor, config.UPSAMPLE))
+    return factor
+
+
+def _downsample_classification_input(img, factor):
+    """Resize ONLY the model input; retain the original tile for full-image output."""
+    if factor == 1:
+        return img
+    target = _inference_input_size(img.shape[-2], img.shape[-1], factor)
+    return t.nn.functional.interpolate(img, size=target, mode='bilinear', align_corners=True)
+
+
+def _restore_classification_prediction(prediction, height, width):
+    """Restore discrete class IDs before buffer assignment, masking or overlap crop."""
+    prediction = np.asarray(prediction, dtype=np.uint8)
+    if prediction.shape != (height, width):
+        prediction = cv2.resize(prediction, (width, height), interpolation=cv2.INTER_NEAREST)
+    return prediction
+
+
 def resample_to_2m_gdal(image_path):
     image_name = os.path.basename(image_path)
     if "GF02" not in image_name and "GF07" not in image_name and "GF2" not in image_name and "GF7" not in image_name:
@@ -539,6 +584,8 @@ def infer(kwargs):
     except:
         cfg.IS_AGRICULTURE_INFER = False
     cfg.set_parse(kwargs)
+    # Apply after both checkpoint metadata and CLI overrides have been read.
+    inference_downsample = _configure_inference_downsample(cfg, logger)
     if cfg.IS_AGRICULTURE_INFER:
         # 农业模型内部把单张切片再次拆点，目前只支持 batch=1。
         cfg.TEST_BATCHES = 1
@@ -660,7 +707,8 @@ def infer(kwargs):
     if cfg.with_tensorrt:
         from torch2trt import torch2trt
         with torch.no_grad():
-            input_data = torch.rand((1, cfg.BAND_NUM, cfg.IMG_SIZE,  cfg.IMG_SIZE), dtype=torch.float).cuda()
+            infer_height, infer_width = _inference_input_size(height, width, inference_downsample, cfg.UPSAMPLE)
+            input_data = torch.rand((1, cfg.BAND_NUM, infer_height, infer_width), dtype=torch.float).cuda()
             model = torch2trt(model, [input_data], max_batch_size=cfg.TEST_BATCHES, fp16_mode=True)
     if local_rank == 0:
         logger.setStageAndProcess('Prepare', '50%').info("构建模型成功")
@@ -882,9 +930,10 @@ def infer(kwargs):
             good_indices = [i for i, s in enumerate(status) if s == 'good']
 
             if good_indices:  # 只有当存在good状态的切片时才进行预测
+                # Do not overwrite img/img_mask: output grids and source bands stay full size.
+                good_img = _downsample_classification_input(img[good_indices], inference_downsample)
                 if cfg.WITH_TTA:
                     # TTA预测只对good状态的切片进行
-                    good_img = img[good_indices]
                     good_img = good_img.data.cpu().numpy().transpose(0, 2, 3, 1)
                     img_tta_set = tta_encoder.tta(good_img)
                     for i in range(len(img_tta_set)):
@@ -921,13 +970,12 @@ def infer(kwargs):
 
                     # 将good切片的预测结果放回对应位置
                     for i, orig_idx in enumerate(good_indices):
-                        pred[orig_idx] = good_pred[i]
+                        pred[orig_idx] = _restore_classification_prediction(good_pred[i], height, width)
 
                 elif cfg.IS_AGRICULTURE_INFER:
                     # 农业推理只对good状态的切片进行
                     t1 = time.time()
                     window_size = cfg.AGRICULTURE_WINDOW_SIZE
-                    good_img = img[good_indices]
                     good_img = good_img.data.cpu().numpy()
                     if cfg.TEST_BATCHES != 1:
                         tqdm.write('[ERROR] THE BATCH OF AGRICULTURE_INFER MUST BE 1')
@@ -935,7 +983,7 @@ def infer(kwargs):
 
                     agricluture_clip = 4
                     data_all = img2points_group(good_img, window_size)
-                    img_pred_clip = np.zeros([1, height, width])
+                    img_pred_clip = np.zeros([1, good_img.shape[-2], good_img.shape[-1]], dtype=np.uint8)
 
                     for i in range(data_all.shape[0] // agricluture_clip):
                         data = data_all[i * agricluture_clip:(i + 1) * agricluture_clip, :, :, :, :].reshape(
@@ -985,12 +1033,12 @@ def infer(kwargs):
 
                     # 将good切片的预测结果放回对应位置
                     for i, orig_idx in enumerate(good_indices):
-                        pred[orig_idx] = img_pred_clip[i]
+                        pred[orig_idx] = _restore_classification_prediction(img_pred_clip[i], height, width)
 
                 else:
                     # 普通推理只对good状态的切片进行
                     with t.no_grad():
-                        good_data = Variable(img[good_indices])
+                        good_data = Variable(good_img)
                         if cfg.USE_GPU:
                             if _USE_DIST:
                                 good_data = good_data.cuda(local_rank, non_blocking=cfg.NON_BLOCKING)
@@ -1021,7 +1069,7 @@ def infer(kwargs):
 
                     # 将good切片的预测结果放回对应位置
                     for i, orig_idx in enumerate(good_indices):
-                        pred[orig_idx] = good_pred[i]
+                        pred[orig_idx] = _restore_classification_prediction(good_pred[i], height, width)
             #
             for i in range(pred.shape[0]):
                 if status[i] == 'good':
