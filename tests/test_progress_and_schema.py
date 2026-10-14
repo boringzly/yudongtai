@@ -511,7 +511,7 @@ class EntryProgressTests(unittest.TestCase):
             ROOT / "change" / "test_lib_batch_memeff_single_image_nomp.py"
         ).read_text(encoding="utf-8")
         self.assertIn("'TEST_IMG_SIZE': 1280", source)
-        self.assertIn("'TEST_BATCHES': 1", source)
+        self.assertIn("'TEST_BATCHES': change_batch_size()", source)
         self.assertIn("'TEST_PREFETCH_FACTOR': 1", source)
 
     def test_classification_temp_dirs_are_cleaned_on_entry_exit(self):
@@ -679,7 +679,7 @@ class MultiGpuInferenceTests(unittest.TestCase):
         batch_source = (ROOT / "change" / "change_detection_core.py").read_text(
             encoding="utf-8"
         )
-        self.assertIn("'TEST_BATCHES': 1", inference_source)
+        self.assertIn("'TEST_BATCHES': change_batch_size()", inference_source)
         self.assertNotIn("net = torch.nn.DataParallel(", inference_source)
         self.assertIn("multiprocessing.get_context('spawn')", batch_source)
         self.assertIn("target=_change_pair_worker", batch_source)

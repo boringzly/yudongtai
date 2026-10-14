@@ -5,6 +5,8 @@ import shutil
 import gc
 from pathlib import Path
 from time import sleep
+from time import perf_counter
+from inference_metrics import InferenceMetrics, change_batch_size
 import numpy as np
 from osgeo import gdal, ogr, osr
 from datasets.DataUtils import DataUtils
@@ -915,7 +917,7 @@ def test_lib_big_memeff(pre_img_path='', post_img_path='', output_path='', logge
         'MODEL_BACKBONE': 'vssm_tiny',
         'MODEL_NUM_CLASSES': 1,
         # 每个影像进程固定使用一张 GPU；不同影像由外层进程并行调度。
-        'TEST_BATCHES': 1,
+        'TEST_BATCHES': change_batch_size(),
         # 根据 Pod CPU 配额和并行影像数均分约 80%；HAMi 环境默认每卡最多 8 个，
         # 其余 CPU 留给主进程、GPU 喂数、GDAL 写出和消息线程。
         'TEST_NUM_WORKERS': (
@@ -991,6 +993,8 @@ def test_lib(local_rank, gpu_count, cfg, logger, progress_callback=None):
     else:
         device = torch.device('cpu')
 
+    efficiency = InferenceMetrics(logger, os.path.basename(cfg.PRE_IMG_PATH), cfg.TEST_BATCHES,
+                                  torch.cuda if gpu_count > 0 else None)
     if logger is not None:
         if gpu_count > 0:
             gpu_names = [torch.cuda.get_device_name(index) for index in range(gpu_count)]
@@ -1240,11 +1244,15 @@ def test_lib(local_rank, gpu_count, cfg, logger, progress_callback=None):
         # cur_batch = 0
         # pre_img, post_img, nodata_mask, indexs = None, None, None, None
 
-        for idx, (pre_img, post_img, nodata_mask, indexs) in enumerate(data_loader_test):
+        efficiency.start_loop(total_patches)
+        for idx, (pre_img, post_img, nodata_mask, indexs) in enumerate(efficiency.iter_batches(data_loader_test)):
+            prepare_started = perf_counter()
             batch_patches = int(nodata_mask.size(0))
             # 跳过无效数据
             non_zero_mask = nodata_mask.view(nodata_mask.size(0), -1).abs().sum(dim=1) != 0
             if non_zero_mask.sum() == 0:
+                efficiency.add('prepare', prepare_started)
+                efficiency.complete_batch(batch_patches, 0)
                 processed_patches += batch_patches
                 if local_rank == 0:
                     pbar.update(batch_patches)
@@ -1257,6 +1265,8 @@ def test_lib(local_rank, gpu_count, cfg, logger, progress_callback=None):
             valid_indexs = [component[non_zero_mask] for component in indexs]
 
             img = np.concatenate((pre_img, post_img), 1)
+            efficiency.add('prepare', prepare_started)
+            inference_started = perf_counter()
             if cfg.WITH_TTA:
                 img90 = np.array(np.rot90(img, axes=(2, 3)))  # rotate 90
                 img1 = np.ascontiguousarray(np.concatenate([img, img90]), dtype=np.float32)  # concat raw and rot90
@@ -1273,6 +1283,10 @@ def test_lib(local_rank, gpu_count, cfg, logger, progress_callback=None):
                     output2 = test_normal(net2, img, cfg.MODEL_NUM_CLASSES, device)
             if net2 is not None:
                 output = np.bitwise_or(output, output2)
+            # test_normal/test_with_TTA return CPU numpy arrays, so GPU results
+            # are already synchronized here; do not add a device-wide barrier.
+            efficiency.add('inference', inference_started)
+            write_started = perf_counter()
             for i in range(output.shape[0]):
                 # maskout nodata area
                 pred = output[i] * valid_nodata_mask[i].numpy().astype(output[i].dtype)
@@ -1309,13 +1323,19 @@ def test_lib(local_rank, gpu_count, cfg, logger, progress_callback=None):
                         or gdal.GetLastErrorType() >= gdal.CE_Failure):
                     error_message = gdal.GetLastErrorMsg() or 'unknown GDAL error'
                     raise RuntimeError(f'写入变化检测 BigTIFF 失败: {error_message}')
+            efficiency.add('write', write_started)
+            efficiency.complete_batch(batch_patches, int(output.shape[0]))
             processed_patches += batch_patches
             if local_rank == 0:
                 pbar.update(batch_patches)
                 if progress_callback is not None and total_patches > 0:
                     # 按真实切片数汇报；多卡 batch>1 时进度与 ETA 仍保持准确。
                     progress_callback(processed_patches, total_patches)
+        efficiency.report('切片循环结束')
+        overview_started = perf_counter()
         build_overviews(out_data)
+        efficiency.phase_done('TIFF概览及收尾写盘', overview_started)
+        vector_started = perf_counter()
         del test_data.predataset
         del test_data.postdataset
         # raster to shapefile
@@ -1374,6 +1394,7 @@ def test_lib(local_rank, gpu_count, cfg, logger, progress_callback=None):
         feature_count = layer.GetFeatureCount()
         del shape_dataset
         del out_data
+        efficiency.phase_done('矢量化及属性写出', vector_started)
         if feature_count == 0:
             if logger is not None:
                 logger.info('未检测到变化图斑，保留空矢量文件供后续分类')
@@ -1384,8 +1405,10 @@ def test_lib(local_rank, gpu_count, cfg, logger, progress_callback=None):
                 dst = str(Path(out_shp_namelist1[0]).with_suffix(ext))
                 if os.path.exists(src):
                     _shutil.copy2(src, dst)
+            efficiency.finish()
             continue
 
+        smooth_started = perf_counter()
         if logger is not None:
             logger.info('矢量优化')
         fill_hole_shp = str(Path(out_shp_namelist[0]).parent / (Path(out_shp_namelist[0]).stem + '_fillhole.shp'))
@@ -1394,6 +1417,8 @@ def test_lib(local_rank, gpu_count, cfg, logger, progress_callback=None):
         smooth_polygons_gdf_used(fill_hole_shp, output_shp)
         if logger is not None:
             logger.info('矢量优化完成')
+        efficiency.phase_done('矢量填洞及平滑', smooth_started)
+        efficiency.finish()
 
         # os.remove(out_namelist[n])
 
