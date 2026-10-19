@@ -7,20 +7,31 @@
 ## 从本次旧任务 7052 恢复
 
 更新服务器代码，并使用仓库根目录 `change_detection_wf.json` 的工作流定义。
-它新增了两个入口参数并传递给变化检测步骤。新任务设置：
+工作流引擎 6.1 不用输入声明中的 `default` 补齐环境变量，因此续跑设置
+**不能放在 `input.parameters` 或步骤的 `parameters.input` 中**。
+算法直接读取已有 `WF_CONFIG` 环境变量的 `config` 字段，无需修改 Kubernetes YAML。
+新任务将工作流顶层 `config` 改为：
 
 ```json
 {
-  "resume_from": "7052",
-  "resume_allow_legacy": true
+  "config": {
+    "fast_run": false,
+    "resume_from": "7052",
+    "resume_allow_legacy": true
+  }
 }
 ```
 
-这只是**入口参数值**，不是完整工作流替代配置。平台若从环境变量读取参数，
-请在新任务/Pod 设置同名环境变量，值分别为 `7052` 和 `true`。
-也支持 `CHANGE_DETECTION_RESUME_FROM` / `CHANGE_DETECTION_RESUME_ALLOW_LEGACY`。
+这只是顶层 `config` 片段，不是完整工作流替代配置。
+正常新跑用 `resume_from: ""`、`resume_allow_legacy: false`。
+完整旧任务恢复示例见 `change_detection_wf_resume_7052.json`。
+必须同时部署本次入口修复；仅使用旧版 12f5147 不会读取这些 config 字段。
+算法仍兼容独立同名环境变量，以及 `CHANGE_DETECTION_RESUME_FROM` / `CHANGE_DETECTION_RESUME_ALLOW_LEGACY`。
 CLI 对应 `--resume_from 7052 --resume_allow_legacy true`。
-不要在宿主机简单 `export` 后以为 Kubernetes Pod 会自动继承。
+优先级为 CLI > 独立环境变量 > WF_CONFIG.config > 关闭默认值。
+本平台无需设置额外环境变量。不要保留旧版两处外部续跑参数声明，否则工作流引擎
+会在执行算法入口之前失败。不要在宿主机简单 `export` 后以为 Pod 会继承。
+启动日志应出现 `[续跑配置] resume_from='7052', resume_allow_legacy=True`。
 
 默认两个参数为空字符串、false，不会自动跨任务复用。
 7052 的旧版没有完成清单，因此必须显式允许 legacy 导入，并由操作者确认前后影像、

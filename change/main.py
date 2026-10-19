@@ -1,5 +1,6 @@
 from change_detection_core import entry
 import os
+import json
 
 
 def parse_bool(value):
@@ -12,6 +13,36 @@ def parse_bool(value):
     if normalized in {'0', 'false', 'no', 'n', 'off', ''}:
         return False
     raise ValueError(f'无法解析布尔值: {value}')
+
+
+def resolve_resume_options(resume_from=None, resume_allow_legacy=None, environ=None):
+    """Read WF_CONFIG directly; engine 6.1 requires env for declared inputs.
+
+    Priority: explicit CLI (including empty/false), environment, WF_CONFIG.config,
+    then disabled defaults. Do NOT add these settings to input.parameters.
+    """
+    environ = os.environ if environ is None else environ
+    raw = environ.get('WF_CONFIG', '').strip()
+    config = {}
+    if raw:
+        try:
+            workflow = json.loads(raw)
+            if not isinstance(workflow, dict):
+                raise ValueError('WF_CONFIG 必须是 JSON 对象')
+            config = workflow.get('config', {})
+            if not isinstance(config, dict):
+                raise ValueError('WF_CONFIG.config 必须是 JSON 对象')
+        except (ValueError, TypeError) as exc:
+            raise ValueError('无法读取 WF_CONFIG 续跑配置: %s' % exc) from exc
+    if resume_from is None:
+        resume_from = environ.get('resume_from', environ.get(
+            'CHANGE_DETECTION_RESUME_FROM', config.get('resume_from', '')))
+    if resume_allow_legacy is None:
+        resume_allow_legacy = environ.get('resume_allow_legacy', environ.get(
+            'CHANGE_DETECTION_RESUME_ALLOW_LEGACY', config.get('resume_allow_legacy', False)))
+    if isinstance(resume_from, bool) or not isinstance(resume_from, (str, int)):
+        raise ValueError('resume_from 必须是任务 ID 字符串或绝对路径')
+    return str(resume_from).strip(), parse_bool(resume_allow_legacy)
 
 
 if __name__ == '__main__':
@@ -36,10 +67,10 @@ if __name__ == '__main__':
         help='双模型模式下的第二个模型权重路径',
     )
     parser.add_argument('--dst_path', type=str, required=True, help='输出目录路径')
-    parser.add_argument('--resume_from', default=os.environ.get('resume_from', os.environ.get('CHANGE_DETECTION_RESUME_FROM', '')),
+    parser.add_argument('--resume_from', default=None,
                         help='续跑源任务 ID 或旧任务/变化检测步骤绝对目录，默认不跨任务复用')
     parser.add_argument('--resume_allow_legacy', type=parse_bool, nargs='?', const=True,
-                        default=os.environ.get('resume_allow_legacy', os.environ.get('CHANGE_DETECTION_RESUME_ALLOW_LEGACY', 'false')),
+                        default=None,
                         help='显式允许从旧版逐图完成日志导入结果；须确认输入和模型未变')
     parser.add_argument('--output_dataset', type=str, required=False, default=None)
     parser.add_argument('--step_id', type=str, required=False, default=None)
@@ -49,6 +80,8 @@ if __name__ == '__main__':
     parser.add_argument('--kafka_task_id', type=str, required=False, default=None)
     parser.add_argument('--debug', action='store_true')
     args, unknown = parser.parse_known_args()
+    args.resume_from, args.resume_allow_legacy = resolve_resume_options(
+        args.resume_from, args.resume_allow_legacy)
     pre_image = args.pre_image
     post_image = args.post_image
     model_path = args.model_path
@@ -63,6 +96,7 @@ if __name__ == '__main__':
     kafka_task_id = args.kafka_task_id
     debug = args.debug
     print(args)
+    print(f'[续跑配置] resume_from={args.resume_from!r}, resume_allow_legacy={args.resume_allow_legacy}', flush=True)
     if debug: import pudb; pu.db
     entry(
         pre_image,
