@@ -1,4 +1,5 @@
 from change_detection_core import entry
+import os
 
 
 def parse_bool(value):
@@ -35,6 +36,11 @@ if __name__ == '__main__':
         help='双模型模式下的第二个模型权重路径',
     )
     parser.add_argument('--dst_path', type=str, required=True, help='输出目录路径')
+    parser.add_argument('--resume_from', default=os.environ.get('resume_from', os.environ.get('CHANGE_DETECTION_RESUME_FROM', '')),
+                        help='续跑源任务 ID 或旧任务/变化检测步骤绝对目录，默认不跨任务复用')
+    parser.add_argument('--resume_allow_legacy', type=parse_bool, nargs='?', const=True,
+                        default=os.environ.get('resume_allow_legacy', os.environ.get('CHANGE_DETECTION_RESUME_ALLOW_LEGACY', 'false')),
+                        help='显式允许从旧版逐图完成日志导入结果；须确认输入和模型未变')
     parser.add_argument('--output_dataset', type=str, required=False, default=None)
     parser.add_argument('--step_id', type=str, required=False, default=None)
     parser.add_argument('--step_name', type=str, required=False, default=None)
@@ -71,4 +77,6 @@ if __name__ == '__main__':
         kafka_task_id,
         use_two_models=use_two_models,
         second_model_path=second_model_path,
+        resume_from=args.resume_from,
+        resume_allow_legacy=args.resume_allow_legacy,
     )

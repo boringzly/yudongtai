@@ -50,6 +50,20 @@ parameters:
     position: "output"
     runtime_input: true
 
+  - id: "resume_from"
+    name: "续跑源任务ID或绝对目录"
+    type: "str"
+    required: false
+    default: ""
+    position: "input"
+
+  - id: "resume_allow_legacy"
+    name: "允许导入旧版完成日志（需确认输入模型未变）"
+    type: "bool"
+    required: false
+    default: false
+    position: "input"
+
   - id: "output_dataset"
     name: "输出数据集目录"
     type: "str"

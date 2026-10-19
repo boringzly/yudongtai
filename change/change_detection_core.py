@@ -317,11 +317,26 @@ def _detect_change_gpu_count():
 
 def _is_dataloader_worker_failure(error):
     message = str(error).lower()
-    return 'dataloader worker' in message and 'exited unexpectedly' in message
+    return ('dataloader worker' in message and 'exited unexpectedly' in message
+            or 'dataloader timed out' in message)
 
 
 def _change_pair_worker(task_queue, event_queue, staging_lock, gpu_slot, parallel_jobs):
     """一个进程独占一张 GPU，持续领取影像对执行推理。"""
+    # If the task parent disappears, do not leave an orphan holding CUDA/HAMi
+    # resources indefinitely. The monitor doesn't call CUDA or take its locks.
+    import threading
+    parent_pid = os.getppid()
+    if parent_pid == 1:
+        raise RuntimeError('变化检测父进程已退出')
+
+    def watch_parent():
+        while True:
+            time.sleep(5)
+            if os.getppid() != parent_pid:
+                os._exit(70)
+
+    threading.Thread(target=watch_parent, daemon=True).start()
     if gpu_slot is None:
         os.environ['CUDA_VISIBLE_DEVICES'] = ''
         worker_label = 'CPU'
@@ -376,6 +391,9 @@ def _process_change_pair(task, event_queue, staging_lock, worker_label):
     try:
         # 必须在 CUDA_VISIBLE_DEVICES 设置完成后导入，确保本进程只看到绑定的卡。
         from test_lib_batch_memeff_single_image_nomp import test_lib_big_memeff
+        from resume_checkpoint import invalidate, save_checkpoint
+
+        invalidate(task['checkpoint_dir'], stem)
 
         shared_tif_src = os.path.join(shp_dir, f'{stem}.tif')
         tif_dst = os.path.join(tif_dir, f'{stem}.tif')
@@ -473,6 +491,8 @@ def _process_change_pair(task, event_queue, staging_lock, worker_label):
                 'DataLoader worker 异常退出，清理本次未完成输出并以 num_workers=0 重试: %s',
                 inference_error,
             )
+            # Keep the fallback for subsequent pairs in this GPU process.
+            os.environ['CHANGE_DETECTION_DATA_WORKERS'] = '0'
             event_queue.put({
                 'type': 'retry',
                 'idx': idx,
@@ -505,6 +525,9 @@ def _process_change_pair(task, event_queue, staging_lock, worker_label):
         if not os.path.exists(output_shp):
             raise NonFatalTaskWarning(f'变化检测结果复制后缺失: {output_shp}')
         feature_count = _shapefile_feature_count(output_shp)
+        # Persist BEFORE GPU cleanup / IPC: parent loss must not discard success.
+        save_checkpoint(task['checkpoint_dir'], stem, task['checkpoint_identity'],
+                        output_shp, feature_count)
         if feature_count == 0:
             logger.info('处理 %s 完成：未检测到变化图斑，输出有效空 SHP', stem)
         else:
@@ -647,7 +670,8 @@ def change_detection(pre_image, post_image, model_path, dst_path, output_dataset
 # ========== 批量变化检测（文件夹模式）==========
 
 def change_detection_folder(pre_folder, post_folder, model_path, dst_path, output_dataset,
-                            use_two_models=False, second_model_path=None):
+                            use_two_models=False, second_model_path=None,
+                            resume_from='', resume_allow_legacy=False):
     """批量变化检测：遍历前时相文件夹中所有影像文件，在后时相文件夹中匹配同名文件进行变化检测"""
     global prg_sender
 
@@ -685,6 +709,8 @@ def change_detection_folder(pre_folder, post_folder, model_path, dst_path, outpu
     total = len(valid_pairs)
     if total == 0:
         raise RuntimeError('未找到任何匹配的前后时相影像对')
+    if len({pre.stem for pre, _ in valid_pairs}) != total:
+        raise ValueError('前时相存在同名 .tif/.tiff，输出会冲突，请先移除重复输入')
 
     swap_write('total_pairs', total)
     if skipped_unmatched:
@@ -701,44 +727,85 @@ def change_detection_folder(pre_folder, post_folder, model_path, dst_path, outpu
     logger, log_path = _configure_persistent_logger('change_detection_batch', dst_path)
     logger.info('持久化日志: %s', log_path)
 
+    from resume_checkpoint import (run_identity, pair_identity, resolve_source,
+                                   legacy_completions, restore, record_path)
+    checkpoint_dir = os.path.join(_ensure_log_dir(dst_path), 'change_detection_checkpoints')
+    logger.info('正在建立续跑指纹（模型及推理代码校验）')
+    run = run_identity(model_path, use_two_models, second_model_path)
+    source = resolve_source(resume_from, dst_path)
+    if source and Path(source[0]).resolve() == Path(dst_path).resolve() and resume_allow_legacy:
+        raise ValueError('旧日志导入必须写入新的任务目录，不能覆盖旧任务')
+    legacy = legacy_completions(source[1]) if source and resume_allow_legacy else {}
+    if source and resume_allow_legacy:
+        logger.warning('旧结果导入已启用：仅验证日志与结果完整性，无法证明历史影像和模型内容未变；源=%s', source[0])
+    tasks = []
+    results_by_index = {}
+    rejected = []
+    for idx, (pre_path, post_path) in enumerate(valid_pairs):
+        stem = pre_path.stem
+        task = {
+            'idx': idx, 'total': total, 'stem': stem,
+            'pre_path': str(pre_path), 'post_path': str(post_path),
+            'output_shp': os.path.join(shp_dir, f'{stem}.shp'),
+            'shp_dir': shp_dir, 'tif_dir': tif_dir, 'dst_path': dst_path,
+            'model_path': model_path, 'use_two_models': use_two_models,
+            'second_model_path': second_model_path, 'checkpoint_dir': checkpoint_dir,
+            'checkpoint_identity': pair_identity(pre_path, post_path, run),
+        }
+        candidates = []
+        if record_path(checkpoint_dir, stem).is_file():
+            candidates.append((dst_path, checkpoint_dir, {}, False))
+        if source:
+            candidates.append((source[0], source[1] / 'change_detection_checkpoints', legacy, resume_allow_legacy))
+        for old_step, old_records, old_legacy, allow_legacy in candidates:
+            try:
+                results_by_index[idx] = restore(task, old_step, old_records, old_legacy,
+                                                allow_legacy, _copy_shapefile_dataset)
+                logger.info('[续跑] 已恢复 (%s/%s) %s，图斑数=%s', idx + 1, total, stem,
+                            results_by_index[idx]['feature_count'])
+                break
+            except (OSError, ValueError, RuntimeError) as exc:
+                rejected.append({'file': stem, 'source': str(old_step), 'reason': str(exc)})
+                logger.info('[续跑] 不复用 %s: %s', stem, exc)
+        if idx not in results_by_index:
+            tasks.append(task)
+        if idx % 100 == 0 or idx + 1 == total:
+            prg_sender.send({'progress': 1 + 4 * (idx + 1) / total, 'runningStatus': 'running',
+                             'runningInfo': f'校验续跑结果 {idx+1}/{total}，已恢复 {len(results_by_index)} 对'})
+    resumed_count = len(results_by_index)
+    logger.info('[续跑] 校验完成：总计=%s，已恢复=%s，待计算=%s；源=%s',
+                total, resumed_count, len(tasks), resume_from or '当前任务完成清单')
+    _write_diagnostic_report(dst_path, 'change_detection_resume.json', {
+        'source': str(source[0]) if source else None, 'total': total,
+        'resumed_count': resumed_count, 'pending_count': len(tasks),
+        'legacy_allowed': resume_allow_legacy, 'rejected': rejected,
+        'checkpoint_dir': checkpoint_dir,
+    })
+
     output_shp_list = []
     failed_list = []
     empty_result_list = []
     feature_counts = {}
-    gpu_count = _detect_change_gpu_count()
-    parallel_jobs = min(total, gpu_count) if gpu_count > 0 else 1
+    gpu_count = _detect_change_gpu_count() if tasks else 0
+    parallel_jobs = min(len(tasks), max(gpu_count, 1))
     execution_label = (
         f'{parallel_jobs} 张 GPU 影像级并行，每张 GPU 独立处理一对影像'
         if gpu_count > 0
-        else '未检测到 GPU，使用单个 CPU 进程'
+        else ('未检测到 GPU，使用单个 CPU 进程' if tasks else '全部结果已恢复，无需推理')
     )
     logger.info('变化检测执行方式: %s', execution_label)
     prg_sender.send({
-        'progress': 5,
+        'progress': prg_sender.calc_progress_value(resumed_count, total, 5, 95),
         'runningStatus': 'running',
-        'runningInfo': execution_label,
+        'runningInfo': f'已恢复 {resumed_count}/{total} 对，待计算 {len(tasks)} 对；{execution_label}',
     })
 
     context = multiprocessing.get_context('spawn')
     task_queue = context.Queue()
     event_queue = context.Queue()
     staging_lock = context.Lock()
-    for idx, (pre_path, post_path) in enumerate(valid_pairs):
-        stem = pre_path.stem
-        task_queue.put({
-            'idx': idx,
-            'total': total,
-            'stem': stem,
-            'pre_path': str(pre_path),
-            'post_path': str(post_path),
-            'output_shp': os.path.join(shp_dir, f'{stem}.shp'),
-            'shp_dir': shp_dir,
-            'tif_dir': tif_dir,
-            'dst_path': dst_path,
-            'model_path': model_path,
-            'use_two_models': use_two_models,
-            'second_model_path': second_model_path,
-        })
+    for task in tasks:
+        task_queue.put(task)
     for _ in range(parallel_jobs):
         task_queue.put(None)
 
@@ -753,11 +820,19 @@ def change_detection_folder(pre_folder, post_folder, model_path, dst_path, outpu
         process.start()
         workers.append(process)
 
-    pair_progress = {idx: 0.0 for idx in range(total)}
-    results_by_index = {}
+    pair_progress = {idx: float(idx in results_by_index) for idx in range(total)}
+    worker_activity = {('GPU %s' % (i + 1) if gpu_count else 'CPU'): time.monotonic()
+                       for i in range(parallel_jobs)}
+    stall_timeout = max(60, int(os.environ.get('CHANGE_DETECTION_STALL_TIMEOUT', '1800')))
     dead_queue_polls = 0
     try:
         while len(results_by_index) < total:
+            for i, process in enumerate(workers):
+                label = 'GPU %s' % (i + 1) if gpu_count else 'CPU'
+                if process.exitcode not in (None, 0):
+                    raise RuntimeError(f'{label} 子进程异常退出，exitcode={process.exitcode}；已完成结果保留，可续跑')
+                if process.is_alive() and time.monotonic() - worker_activity[label] > stall_timeout:
+                    raise RuntimeError(f'{label} 超过 {stall_timeout} 秒无进度，终止本批次；已完成结果保留，可续跑')
             try:
                 event = event_queue.get(timeout=1)
             except queue.Empty:
@@ -775,6 +850,7 @@ def change_detection_folder(pre_folder, post_folder, model_path, dst_path, outpu
             idx = event.get('idx')
             stem = event.get('stem', '')
             worker_label = event.get('worker', 'worker')
+            worker_activity[worker_label] = time.monotonic()
 
             if event_type == 'started':
                 logger.info(
@@ -876,8 +952,14 @@ def change_detection_folder(pre_folder, post_folder, model_path, dst_path, outpu
             if process.is_alive():
                 process.terminate()
                 process.join(timeout=5)
+        # Unconsumed tasks/events must not keep feeder threads alive on failure.
+        task_queue.cancel_join_thread()
+        event_queue.cancel_join_thread()
         task_queue.close()
         event_queue.close()
+
+    if len(results_by_index) != total:
+        raise RuntimeError('批次未完整返回，已完成结果保留；请修复运行环境后续跑')
 
     for idx, (pre_path, _) in enumerate(valid_pairs):
         stem = pre_path.stem
@@ -950,6 +1032,8 @@ def change_detection_folder(pre_folder, post_folder, model_path, dst_path, outpu
         'visible_gpu_count': gpu_count,
         'total': total,
         'processed_count': len(output_shp_list),
+        'resumed_count': resumed_count,
+        'newly_computed_count': len(output_shp_list) - resumed_count,
         'failed_count': len(failed_list),
         'empty_count': len(empty_result_list),
         'empty_results': empty_result_list,
@@ -962,7 +1046,7 @@ def change_detection_folder(pre_folder, post_folder, model_path, dst_path, outpu
     prg_sender.send({'progress': 99, 'runningStatus': 'running', 'runningInfo': '变化检测结果已生成，等待步骤完成'})
 
     # 10. 单个影像失败按告警处理，不中断整个批量工作流。
-    result_msg = f'批量变化检测完成，成功处理 {len(output_shp_list)}/{total} 对影像'
+    result_msg = f'批量变化检测完成，成功处理 {len(output_shp_list)}/{total} 对影像（复用 {resumed_count} 对）'
     if empty_result_list:
         result_msg += f'，其中 {len(empty_result_list)} 对未检测到变化'
     if failed_list:
@@ -974,8 +1058,9 @@ def change_detection_folder(pre_folder, post_folder, model_path, dst_path, outpu
 
 def entry(pre_image, post_image, model_path, dst_path, output_dataset, step_id, step_name,
           kafka_server_ip_port, kafka_topic, kafka_task_id, use_two_models=False,
-          second_model_path=None):
+          second_model_path=None, resume_from='', resume_allow_legacy=False):
     use_two_models = _coerce_bool(use_two_models)
+    resume_allow_legacy = _coerce_bool(resume_allow_legacy)
     task_logger, log_path = _configure_persistent_logger('change_task', dst_path)
     task_logger.info('变化检测任务开始；持久化日志: %s', log_path)
     task_logger.info('输入: pre=%s, post=%s, dst=%s', pre_image, post_image, dst_path)
@@ -1006,8 +1091,12 @@ def entry(pre_image, post_image, model_path, dst_path, output_dataset, step_id, 
                 output_dataset,
                 use_two_models=use_two_models,
                 second_model_path=second_model_path,
+                resume_from=resume_from,
+                resume_allow_legacy=resume_allow_legacy,
             )
         else:
+            if resume_from:
+                raise ValueError('跨任务续跑目前仅支持前后时相目录批量输入')
             change_detection(
                 pre_image,
                 post_image,

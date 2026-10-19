@@ -684,7 +684,7 @@ class MultiGpuInferenceTests(unittest.TestCase):
         self.assertIn("multiprocessing.get_context('spawn')", batch_source)
         self.assertIn("target=_change_pair_worker", batch_source)
         self.assertIn("os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_slot)", batch_source)
-        self.assertIn("parallel_jobs = min(total, gpu_count)", batch_source)
+        self.assertIn("parallel_jobs = min(len(tasks), max(gpu_count, 1))", batch_source)
 
     def test_change_detection_progress_and_indexes_are_batch_safe(self):
         source = (
@@ -716,7 +716,7 @@ class MultiGpuInferenceTests(unittest.TestCase):
         fake_os.environ["CHANGE_DETECTION_PARALLEL_JOBS"] = "2"
         self.assertEqual(namespace["_recommended_dataloader_workers"](), 24)
         fake_os.environ["LD_PRELOAD"] = "/usr/local/vgpu/libvgpu.so"
-        self.assertEqual(namespace["_recommended_dataloader_workers"](), 8)
+        self.assertEqual(namespace["_recommended_dataloader_workers"](), 0)
         fake_os.environ["CHANGE_DETECTION_DATA_WORKERS"] = "4"
         self.assertEqual(namespace["_recommended_dataloader_workers"](), 4)
         fake_os.environ["CHANGE_DETECTION_DATA_WORKERS"] = "0"

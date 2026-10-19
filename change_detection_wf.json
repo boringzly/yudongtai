@@ -25,6 +25,16 @@
                 "name": "是否使用双模型融合",
                 "type": "bool",
                 "default": false
+            },
+            "resume_from": {
+                "name": "续跑源任务ID或绝对目录",
+                "type": "str",
+                "default": ""
+            },
+            "resume_allow_legacy": {
+                "name": "允许导入旧版完成日志（需确认输入模型未变）",
+                "type": "bool",
+                "default": false
             }
         }
     },
@@ -76,6 +86,14 @@
                     "use_two_models": {
                         "from_step": "@entry",
                         "from_name": "use_two_models"
+                    },
+                    "resume_from": {
+                        "from_step": "@entry",
+                        "from_name": "resume_from"
+                    },
+                    "resume_allow_legacy": {
+                        "from_step": "@entry",
+                        "from_name": "resume_allow_legacy"
                     }
                 },
                 "output": {

@@ -101,7 +101,9 @@ def _recommended_dataloader_workers():
         parallel_jobs = 1
     workers_per_job = int(available_cpus * 0.8) // parallel_jobs
     if _running_under_hami():
-        workers_per_job = min(workers_per_job, 8)
+        # Spawn still injects HAMi before worker_init_fn; hiding CUDA there is
+        # too late to avoid its shared-memory lock. Use CPU loading inline.
+        return 0
     return max(1, min(48, workers_per_job))
 
 
@@ -1218,6 +1220,7 @@ def test_lib(local_rank, gpu_count, cfg, logger, progress_callback=None):
                 'multiprocessing_context': 'spawn',
                 'persistent_workers': False,
                 'worker_init_fn': _init_change_dataloader_worker,
+                'timeout': 120,
             })
         data_loader_test = torch.utils.data.DataLoader(test_data, **dataloader_kwargs)
         # create result file
