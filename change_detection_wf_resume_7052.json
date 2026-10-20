@@ -7,7 +7,9 @@
     "config": {
         "fast_run": false,
         "resume_from": "7052",
-        "resume_allow_legacy": true
+        "resume_allow_legacy": true,
+        "classification_resume_from": "",
+        "classification_resume_allow_legacy": false
     },
     "execution_order": [
         "change_detection",

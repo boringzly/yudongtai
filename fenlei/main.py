@@ -1,4 +1,9 @@
 from classification_core import entry
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from fenlei.classification_resume import parse_bool, resolve_options
 
 if __name__ == '__main__':
     import argparse
@@ -16,7 +21,12 @@ if __name__ == '__main__':
     parser.add_argument('--kafka_topic', type=str, required=False, default='')
     parser.add_argument('--kafka_task_id', type=str, required=False, default=None)
     parser.add_argument('--debug', action='store_true')
+    parser.add_argument('--classification_resume_from', default=None)
+    parser.add_argument('--classification_resume_allow_legacy', type=parse_bool, nargs='?', const=True, default=None)
     args, unknown = parser.parse_known_args()
+    resume_from, resume_allow_legacy = resolve_options(
+        args.classification_resume_from, args.classification_resume_allow_legacy)
+    print(f'[分类续跑配置] source={resume_from!r}, allow_legacy={resume_allow_legacy}', flush=True)
     pre_image = args.pre_image
     post_image = args.post_image
     mask_shp = args.mask_shp
@@ -33,4 +43,4 @@ if __name__ == '__main__':
     print(args)
     if debug: import pudb; pu.db
     entry(pre_image, post_image, mask_shp, model_path, dst_path, path_working, output_dataset, step_id, step_name,
-          kafka_server_ip_port, kafka_topic, kafka_task_id)
+          kafka_server_ip_port, kafka_topic, kafka_task_id, resume_from, resume_allow_legacy)

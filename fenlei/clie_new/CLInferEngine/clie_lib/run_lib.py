@@ -89,7 +89,14 @@ def _available_cpu_count():
 
 
 def _recommended_data_workers(gpu_count):
-    """每张 GPU 默认准备 4 个切片 worker，并允许通过环境变量覆盖。"""
+    """HAMi 强制主进程加载，避免 spawn 也注入 libvgpu；普通环境保留并行。"""
+    preload = os.environ.get('LD_PRELOAD', '').lower()
+    if ('libvgpu' in preload or 'hami' in preload
+            or any(os.environ.get(key) for key in (
+                'CUDA_DEVICE_MEMORY_LIMIT', 'CUDA_DEVICE_SM_LIMIT',
+                'CUDA_DEVICE_MEMORY_SHARED_CACHE', 'HAMI_VISIBLE_DEVICES'))
+            or os.path.exists('/tmp/cudevshr.cache')):
+        return 0
     available_cpus = _available_cpu_count()
     configured = os.environ.get('CLIE_DATA_WORKERS')
     if configured is not None:
@@ -823,6 +830,7 @@ def infer(kwargs):
         if data_workers > 0:
             dataloader_kwargs.update({
                 'prefetch_factor': 1,
+                'timeout': 120,
                 # 模型已初始化 CUDA/HAMi，使用 spawn 避免 fork 继承共享锁状态。
                 'multiprocessing_context': 'spawn',
                 # 每张影像都会重建 DataLoader，持久 worker 没有复用收益且会延迟进程退出。

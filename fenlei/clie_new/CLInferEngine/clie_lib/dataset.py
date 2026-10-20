@@ -48,8 +48,9 @@ class InferDataMgr(data.Dataset):
             base_name, ext = os.path.splitext(filename)
             file_name = os.path.basename(base_name)
             maskname = f"./tmp/mask/{file_name}_mask{ext}"
-            self.mask_filename = maskname
-            self.mask_reader = ImageReader(maskname)
+            if os.path.isfile(maskname):
+                self.mask_filename = maskname
+                self.mask_reader = ImageReader(maskname)
         except Exception:
             pass
         self.image_reader.set_band_list(band_list)

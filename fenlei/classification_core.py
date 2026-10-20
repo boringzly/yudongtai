@@ -22,7 +22,7 @@ def _ensure_log_dir(dst_path):
     # Share exactly the same path rule as change detection and its GPU workers.
     repo_root = str(Path(__file__).resolve().parents[1])
     if repo_root not in sys.path:
-        sys.path.append(repo_root)
+        sys.path.insert(0, repo_root)
     from task_artifacts import ensure_log_dir
     return ensure_log_dir(dst_path)
 
@@ -69,29 +69,22 @@ def _write_diagnostic_report(dst_path, filename, payload):
 
 
 def _run_subprocess_logged(command, cwd, env, logger):
-    """实时转发 CLIE 输出，并把 stdout/stderr 完整写入持久化日志。"""
-    logger.info('启动分类子进程: %s', ' '.join(str(part) for part in command))
-    process = subprocess.Popen(
-        command,
-        cwd=cwd,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding='utf-8',
-        errors='replace',
-        bufsize=1,
-    )
+    """完整持久化 stdout/stderr，并对 HAMi/worker 故障和挂起做有界退出。"""
+    from fenlei.classification_runtime import run_logged
+    return run_logged(command, cwd, env, logger)
+
+
+def _map_zonal_chunks(args_list, num_processes):
+    from fenlei.classification_runtime import under_hami, ClassificationRuntimeError
+    if under_hami(os.environ):
+        # CPU-only children still inherit libvgpu; avoid creating them under HAMi.
+        return [_process_chunk(item) for item in args_list]
+    import multiprocessing as mp
     try:
-        for output_line in process.stdout:
-            logger.info('[CLIE] %s', output_line.rstrip('\r\n'))
-    finally:
-        if process.stdout is not None:
-            process.stdout.close()
-    return_code = process.wait()
-    if return_code != 0:
-        raise subprocess.CalledProcessError(return_code, command)
-    return return_code
+        with mp.get_context('spawn').Pool(processes=num_processes) as pool:
+            return pool.map_async(_process_chunk, args_list).get(timeout=1800)
+    except mp.TimeoutError as exc:
+        raise ClassificationRuntimeError('分类分区统计超时，已完成组可续跑') from exc
 
 
 def _resolve_classification_model(model_path, work_dir):
@@ -116,6 +109,9 @@ class NonFatalTaskWarning(RuntimeError):
 
 
 def _is_nonfatal_warning(exc):
+    from fenlei.classification_runtime import ClassificationRuntimeError
+    if isinstance(exc, ClassificationRuntimeError):
+        return False
     if isinstance(exc, NonFatalTaskWarning):
         return True
     message = str(exc).lower()
@@ -621,6 +617,9 @@ def classification(pre_image, post_image, mask_shp, model_path, dst_path, output
     import multiprocessing as mp
 
     def parallel_zonal_stats(gdf, tif_file, num_processes=4):
+        from fenlei.classification_runtime import under_hami
+        if under_hami(os.environ):
+            num_processes = 1
         total_rows = len(gdf)
         num_processes = min(num_processes, total_rows)
         chunk_size = max(total_rows // num_processes, 1)
@@ -633,8 +632,7 @@ def classification(pre_image, post_image, mask_shp, model_path, dst_path, output
                 end_idx = start_idx + chunk_size
             chunks.append(gdf.iloc[start_idx:end_idx])
         args_list = [(chunk, tif_file) for chunk in chunks]
-        with mp.Pool(processes=num_processes) as pool:
-            results = pool.map(_process_chunk, args_list)
+        results = _map_zonal_chunks(args_list, num_processes)
         all_indices, all_classes = [], []
         for indices, classes in results:
             all_indices.extend(indices)
@@ -699,7 +697,8 @@ def classification(pre_image, post_image, mask_shp, model_path, dst_path, output
 
 # ========== 批量类别识别（文件夹模式）==========
 
-def classification_folder(pre_folder, post_folder, mask_folder, model_path, dst_path, path_working, output_dataset):
+def classification_folder(pre_folder, post_folder, mask_folder, model_path, dst_path, path_working, output_dataset,
+                          resume_from='', resume_allow_legacy=False):
     """批量类别识别：遍历前时相文件夹中所有影像文件，在后时相文件夹和掩码文件夹中匹配同名文件进行类别识别"""
     global prg_sender
 
@@ -708,6 +707,8 @@ def classification_folder(pre_folder, post_folder, mask_folder, model_path, dst_
     import geopandas as gpd
     import numpy as np
     import multiprocessing as mp
+    from fenlei.classification_resume import Checkpoints, invalidate, run_identity
+    from fenlei.classification_runtime import ClassificationRuntimeError
 
     pre_path = Path(pre_folder)
     post_path = Path(post_folder)
@@ -775,6 +776,16 @@ def classification_folder(pre_folder, post_folder, mask_folder, model_path, dst_
     run_py = os.path.join(work_dir, "run.py")
     model_file = _resolve_classification_model(model_path, work_dir)
     logger.info('分类模型: %s', model_file)
+    checkpoints = Checkpoints(dst_path, shp_dir, diagnostic_dir, run_identity(model_file),
+                              resume_from, resume_allow_legacy)
+    logger.info('[分类续跑] 源=%s，允许旧版=%s；逐组校验完成凭据，不按文件存在直接跳过',
+                resume_from or '仅当前任务', resume_allow_legacy)
+
+    def save_completed(stem, identity, output_shp, mask_file):
+        try:
+            checkpoints.save(stem, identity, output_shp, mask_file)
+        except Exception as exc:
+            raise ClassificationRuntimeError('分类完成凭据保存失败: %s' % exc) from exc
 
     tmprun_dir = _create_classification_temp_dir()
     logger.info(f"分类临时目录: {tmprun_dir}")
@@ -810,6 +821,25 @@ def classification_folder(pre_folder, post_folder, mask_folder, model_path, dst_
         logger.info(f'Processing ({idx+1}/{total}): pre={pre_file}, post={post_file}, mask={mask_file} -> {output_shp}')
 
         try:
+            identity = checkpoints.identity(pre_file, post_file, mask_file)
+            try:
+                restored_count = checkpoints.restore(stem, identity, output_shp, mask_file, logger)
+            except Exception as exc:
+                raise ClassificationRuntimeError('分类续跑复制或保存凭据失败: %s' % exc) from exc
+            if restored_count is not None:
+                output_shp_list.append(output_shp)
+                feature_counts[stem] = restored_count
+                if restored_count == 0:
+                    empty_result_list.append(stem)
+                prg_sender.send({
+                    'progress': prg_sender.calc_progress_value(idx + 1, total, 5, 95),
+                    'runningStatus': 'running',
+                    'runningInfo': f'分类已完成 {idx+1}/{total}，其中续跑恢复 {checkpoints.resumed} 组',
+                })
+                # Recovered SHPs are sufficient for final output; do not require
+                # old (possibly cleaned) class TIFFs just to regenerate previews.
+                continue
+            invalidate(checkpoints.directory, stem)
             _remove_shapefile_dataset(output_shp)
             # --- 单组类别识别核心逻辑 ---
 
@@ -822,6 +852,7 @@ def classification_folder(pre_folder, post_folder, mask_folder, model_path, dst_
             if len(gdf) == 0:
                 logger.info(f'  mask为空，没有变化区域，保留有效空分类结果: {stem}')
                 _write_empty_classification_shp(output_shp, gdf.crs)
+                save_completed(stem, identity, output_shp, mask_file)
                 output_shp_list.append(output_shp)
                 empty_result_list.append(stem)
                 continue
@@ -888,6 +919,9 @@ def classification_folder(pre_folder, post_folder, mask_folder, model_path, dst_
 
             # f. 并行计算前后时相类别
             def _parallel_zonal_stats(_gdf, _tif_file, num_processes=4):
+                from fenlei.classification_runtime import under_hami
+                if under_hami(os.environ):
+                    num_processes = 1
                 total_rows = len(_gdf)
                 num_processes = min(num_processes, total_rows)
                 chunk_size = max(total_rows // num_processes, 1)
@@ -900,8 +934,7 @@ def classification_folder(pre_folder, post_folder, mask_folder, model_path, dst_
                         end_idx = start_idx + chunk_size
                     chunks.append(_gdf.iloc[start_idx:end_idx])
                 args_list = [(chunk, _tif_file) for chunk in chunks]
-                with mp.Pool(processes=num_processes) as pool:
-                    results = pool.map(_process_chunk, args_list)
+                results = _map_zonal_chunks(args_list, num_processes)
                 all_indices, all_classes = [], []
                 for indices, classes in results:
                     all_indices.extend(indices)
@@ -923,6 +956,7 @@ def classification_folder(pre_folder, post_folder, mask_folder, model_path, dst_
             gdf = format_classification_result(gdf)
             os.makedirs(os.path.dirname(output_shp), exist_ok=True)
             gdf.to_file(output_shp, encoding="utf-8")
+            save_completed(stem, identity, output_shp, mask_file)
 
             logger.info(f'  处理完成，结果保存至：{output_shp}')
             output_shp_list.append(output_shp)
@@ -933,6 +967,13 @@ def classification_folder(pre_folder, post_folder, mask_folder, model_path, dst_
                 'pre_class': tif_file1, 'post_class': tif_file2,
             })
 
+        except ClassificationRuntimeError:
+            _write_diagnostic_report(dst_path, 'classification_resume.json', {
+                'status': 'interrupted', 'source': resume_from, 'total': total,
+                'completed_count': len(output_shp_list), 'resumed_count': checkpoints.resumed,
+                'interrupted_stem': stem,
+            })
+            raise
         except Exception as e:
             logger.exception('处理 %s 失败，已跳过: %s', stem, e)
             failed_list.append({'file': stem, 'error': str(e)})
@@ -941,6 +982,12 @@ def classification_folder(pre_folder, post_folder, mask_folder, model_path, dst_
 
     if failed_list:
         swap_write('warning_list', failed_list)
+    logger.info('[分类续跑] 本次完成=%s/%s，恢复=%s，新算=%s；恢复组不重建抽样渲染图',
+                len(output_shp_list), total, checkpoints.resumed, len(output_shp_list) - checkpoints.resumed)
+    _write_diagnostic_report(dst_path, 'classification_resume.json', {
+        'source': resume_from, 'total': total, 'resumed_count': checkpoints.resumed,
+        'computed_count': len(output_shp_list) - checkpoints.resumed, 'failed_count': len(failed_list),
+    })
     if empty_result_list:
         swap_write('empty_result_list', empty_result_list)
     if not output_shp_list:
@@ -1020,6 +1067,7 @@ def classification_folder(pre_folder, post_folder, mask_folder, model_path, dst_
         'mode': 'batch',
         'total': total,
         'processed_count': len(output_shp_list),
+        'resumed_count': checkpoints.resumed,
         'failed_count': len(failed_list),
         'empty_count': len(empty_result_list),
         'empty_results': empty_result_list,
@@ -1043,7 +1091,7 @@ def classification_folder(pre_folder, post_folder, mask_folder, model_path, dst_
 # ========== 入口函数 ==========
 
 def entry(pre_image, post_image, mask_shp, model_path, dst_path, path_working, output_dataset, step_id, step_name,
-          kafka_server_ip_port, kafka_topic, kafka_task_id):
+          kafka_server_ip_port, kafka_topic, kafka_task_id, resume_from='', resume_allow_legacy=False):
     task_logger, log_path = _configure_persistent_logger('classification_task', dst_path)
     task_logger.info('类别识别任务开始；持久化日志: %s', log_path)
     task_logger.info(
@@ -1066,8 +1114,11 @@ def entry(pre_image, post_image, mask_shp, model_path, dst_path, path_working, o
     try:
         # 自动检测：如果输入为文件夹（目录），则进入批量处理模式
         if os.path.isdir(pre_image) and os.path.isdir(post_image) and os.path.isdir(mask_shp):
-            classification_folder(pre_image, post_image, mask_shp, model_path, dst_path, path_working, output_dataset)
+            classification_folder(pre_image, post_image, mask_shp, model_path, dst_path, path_working, output_dataset,
+                                  resume_from, resume_allow_legacy)
         else:
+            if resume_from:
+                raise ValueError('分类跨任务续跑仅支持目录批量输入')
             classification(pre_image, post_image, mask_shp, model_path, dst_path, output_dataset)
     except Exception as exc:
         if _is_nonfatal_warning(exc):

@@ -979,7 +979,8 @@ class PersistentDiagnosticsTests(unittest.TestCase):
             self.assertIn("logger.exception", source)
             self.assertIn("_failure.json", source)
             self.assertIn("_summary.json", source)
-        self.assertIn("stdout=subprocess.PIPE", classification_source)
+        runtime_source = (ROOT / "fenlei" / "classification_runtime.py").read_text(encoding="utf-8")
+        self.assertIn("stdout=subprocess.PIPE", runtime_source)
         self.assertNotIn("subprocess.run([", classification_source)
 
     def test_workflow_model_paths_are_used_with_legacy_fallback(self):
