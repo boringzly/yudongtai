@@ -1,6 +1,11 @@
 from change_detection_core import entry
 import os
 import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from workflow_batch_config import apply_batch_config
 
 
 def parse_bool(value):
@@ -79,7 +84,9 @@ if __name__ == '__main__':
     parser.add_argument('--kafka_topic', type=str, required=False, default='')
     parser.add_argument('--kafka_task_id', type=str, required=False, default=None)
     parser.add_argument('--debug', action='store_true')
+    parser.add_argument('--change_batch_size', default=None, help='每卡变化检测切片 batch，1～32；默认从工作流 config 读取')
     args, unknown = parser.parse_known_args()
+    apply_batch_config('change', args.change_batch_size)
     args.resume_from, args.resume_allow_legacy = resolve_resume_options(
         args.resume_from, args.resume_allow_legacy)
     pre_image = args.pre_image

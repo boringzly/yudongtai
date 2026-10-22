@@ -3,6 +3,7 @@
 默认每张 GPU 一个进程、处理一对整图，切片仍为 1280×1280，
 现在每批最多推理 **4 对切片**。分类参数不变。单/双 PTH 均使用此批量。
 
+现在也可直接设置工作流 `config.change_batch_size`，详见 [工作流 batch 配置](workflow_batch_config.md)。
 可通过变化检测进程的环境变量 `CHANGE_DETECTION_BATCH_SIZE=1` 回退，
 或设置为 2、4 等作对照；支持 1～32 的整数，缺省或非法值回退到 4。
 它不是每卡进程数。较大 batch 同时增加 CPU 预取/共享内存及显存压力，

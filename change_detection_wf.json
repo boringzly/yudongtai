@@ -6,6 +6,8 @@
     "email": "",
     "config": {
         "fast_run": false,
+        "change_batch_size": 4,
+        "classification_batch_per_gpu": 8,
         "resume_from": "",
         "resume_allow_legacy": false,
         "classification_resume_from": "",

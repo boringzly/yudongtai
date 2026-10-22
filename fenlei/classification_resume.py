@@ -58,7 +58,7 @@ def run_identity(model_file, environ=None):
         factor = 2
     factor = factor if factor in (1, 2) else 2
     try:
-        batch = max(1, min(16, int(env.get('CLIE_BATCH_PER_GPU', '8'))))
+        batch = max(1, min(64, int(env.get('CLIE_BATCH_PER_GPU', '8'))))
     except ValueError:
         batch = 8
     return {'schema': 1, 'algorithm': code.hexdigest(), 'model_name': model.name,

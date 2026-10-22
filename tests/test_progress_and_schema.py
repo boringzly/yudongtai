@@ -770,7 +770,7 @@ class MultiGpuInferenceTests(unittest.TestCase):
         fake_os.environ["CLIE_BATCH_PER_GPU"] = "12"
         self.assertEqual(namespace["_classification_batch_per_gpu"](), 12)
         fake_os.environ["CLIE_BATCH_PER_GPU"] = "99"
-        self.assertEqual(namespace["_classification_batch_per_gpu"](), 16)
+        self.assertEqual(namespace["_classification_batch_per_gpu"](), 64)
 
         cost_volume_source = (
             ROOT / "fenlei" / "clie_new" / "networks" / "utils" / "CostVolume.py"

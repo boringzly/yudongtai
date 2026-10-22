@@ -4,6 +4,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from fenlei.classification_resume import parse_bool, resolve_options
+from workflow_batch_config import apply_batch_config
 
 if __name__ == '__main__':
     import argparse
@@ -21,9 +22,11 @@ if __name__ == '__main__':
     parser.add_argument('--kafka_topic', type=str, required=False, default='')
     parser.add_argument('--kafka_task_id', type=str, required=False, default=None)
     parser.add_argument('--debug', action='store_true')
+    parser.add_argument('--classification_batch_per_gpu', default=None, help='每卡分类切片 batch，1～64；默认从工作流 config 读取')
     parser.add_argument('--classification_resume_from', default=None)
     parser.add_argument('--classification_resume_allow_legacy', type=parse_bool, nargs='?', const=True, default=None)
     args, unknown = parser.parse_known_args()
+    apply_batch_config('classification', args.classification_batch_per_gpu)
     resume_from, resume_allow_legacy = resolve_options(
         args.classification_resume_from, args.classification_resume_allow_legacy)
     print(f'[分类续跑配置] source={resume_from!r}, allow_legacy={resume_allow_legacy}', flush=True)

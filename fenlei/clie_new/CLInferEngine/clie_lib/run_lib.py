@@ -110,10 +110,10 @@ def _recommended_data_workers(gpu_count):
 
 
 def _classification_batch_per_gpu():
-    """L20 分类默认每卡 8 张切片，可通过 CLIE_BATCH_PER_GPU 在 1～16 间调整。"""
+    """默认每卡 8 张切片，可通过 CLIE_BATCH_PER_GPU 在 1～64 间调整。"""
     configured = os.environ.get('CLIE_BATCH_PER_GPU', '8')
     try:
-        return max(1, min(16, int(configured)))
+        return max(1, min(64, int(configured)))
     except (TypeError, ValueError):
         return 8
 

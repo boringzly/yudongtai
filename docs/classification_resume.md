@@ -1,5 +1,8 @@
 # 分类 HAMi 保护和跨任务续跑
 
+每卡 batch 现可在工作流 `config.classification_batch_per_gpu` 设置，默认8；
+详见 [工作流 batch 配置](workflow_batch_config.md)。更改 batch 会影响严格续跑签名。
+
 ## 工作流配置（不需要改 Kubernetes YAML）
 
 在原工作流顶层 `config` 增加分类的两个参数，不要加到 `input.parameters` 或步骤输入映射。
