@@ -189,9 +189,10 @@ class ClassificationMajorityTests(unittest.TestCase):
             indices, classes = self.functions["_process_chunk"]((chunk, "classification.tif"))
         self.assertEqual(indices, [17, 4, 31])
         self.assertEqual(classes, [5, 4, 0])
-        source.read.assert_called_once_with(1)
+        rasterio.open.assert_not_called()
+        source.read.assert_not_called()
         rasterstats.zonal_stats.assert_called_once_with(
-            chunk, pixels, affine=affine, categorical=True, nodata=0, all_touched=False,
+            chunk, "classification.tif", band=1, categorical=True, nodata=0, all_touched=False,
         )
 
 
@@ -692,8 +693,8 @@ class MultiGpuInferenceTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("total_patches = len(test_data)", source)
         self.assertIn("processed_patches += batch_patches", source)
-        self.assertIn("valid_nodata_mask = nodata_mask[non_zero_mask]", source)
-        self.assertIn("valid_indexs = [component[non_zero_mask] for component in indexs]", source)
+        self.assertIn("img, valid_nodata_mask, valid_indexs = pack_valid_batch(", source)
+        self.assertIn("pred = output[i] * valid_nodata_mask[i].astype(output[i].dtype)", source)
 
     def test_change_detection_workers_are_hami_safe_and_configurable(self):
         source_path = ROOT / "change" / "test_lib_batch_memeff_single_image_nomp.py"

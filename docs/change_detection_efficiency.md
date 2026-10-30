@@ -29,3 +29,34 @@
 
 优先对比同样影像及单/双模型设置下的有效吞吐和单对总耗时。
 计时阶段不含全部日志/消息开销，且后台预取有重叠，不应当作 CPU/GPU 利用率。
+
+
+## HAMi 数据供给优化
+
+HAMi + GPU 且 `num_workers=0` 时，默认使用两个 CPU 线程读取和预处理切片。
+各线程独立创建 OnlineDataset/GDAL 句柄，不创建子进程、不在加载线程调用 CUDA。
+保持切片顺序和 batch 边界，最多缓存下一批切片；异常和提前退出会等待读取结束后关闭句柄。
+FFT 算法、有效切片的归一化、模型、切片尺寸、阈值与输出网格保持原设置。
+无有效像元的切片跳过 FFT；其模型推理原本也会被跳过。
+
+主进程用 NumPy 扫描掩膜和直接组装六通道数组，避免掩膜求和的 int64 临时数组、
+前后时相的大型布尔索引复制。GPU 模式默认 PyTorch CPU 线程数为 4，降低小型 CPU
+操作的线程调度开销；CPU 模型推理默认线程数不受此项影响。
+
+对照开关（必须设置在算法进程启动前，正在运行的 Pod 不会自动应用代码或配置）：
+
+```text
+CHANGE_DETECTION_PREFETCH_THREADS=2   HAMi GPU 默认；支持 0～8
+CHANGE_DETECTION_PREFETCH_THREADS=0   关闭线程预取
+CHANGE_DETECTION_TORCH_THREADS=4      GPU 模式下 CPU 运算线程数
+```
+
+普通多进程 DataLoader 不叠加线程预取。线程模式不锁页或后台传输 GPU 数据。
+`DataLoader配置` 增加 `cpu_prefetch_threads`、`torch_cpu_threads`，线程模式显示
+`start_method=threads`；`num_workers=0` 仍表示未创建子进程。
+`等数据` 仍表示主循环暴露的等待，不等于后台线程全部读取/FFT 的工作量。
+
+先用相同影像、模型与 batch=16 对照端到端耗时、等数据/CPU整理耗时、宿主内存及输出。
+本地缺少 CUDA/GDAL 环境；服务器日志已确认 A100/HAMi 线程预取生效，并取得部分同图耗时对照，
+详见 [2026-10-30 更新说明](update_notes_20261030.md)。不保证固定加速倍数，仍需验证最终输出。
+新增推理模块已纳入续跑算法签名，旧签名结果不会自动按严格模式复用。

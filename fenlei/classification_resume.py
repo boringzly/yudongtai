@@ -52,6 +52,14 @@ def run_identity(model_file, environ=None):
     for path in sources:
         code.update(str(path.relative_to(root)).encode())
         code.update(digest(path).encode())
+    roi = None
+    if env.get('CHANGE_DETECTION_ROI_VECTOR') or env.get('CHANGE_DETECTION_ROI_WKT_FILE'):
+        from change.roi_scope import fingerprint
+        roi = fingerprint(env)
+    helper = root.parent / 'change' / 'roi_scope.py'
+    if helper.is_file():
+        code.update(b'change/roi_scope.py')
+        code.update(digest(helper).encode())
     try:
         factor = int(env.get('CLIE_INFER_DOWNSAMPLE', '2'))
     except ValueError:
@@ -64,7 +72,7 @@ def run_identity(model_file, environ=None):
     return {'schema': 1, 'algorithm': code.hexdigest(), 'model_name': model.name,
             'models': {str(p.relative_to(model)) if model.is_dir() else model.name: digest(p) for p in models},
             'downsample': factor, 'batch_per_gpu': batch,
-            'vector_wkt': env.get('VECTOR_WKT', ''), 'filter_class_id': env.get('FILTER_CLASS_ID', '')}
+            'roi': roi, 'vector_wkt': env.get('VECTOR_WKT', ''), 'filter_class_id': env.get('FILTER_CLASS_ID', '')}
 
 
 def pair_identity(pre, post, mask, run):
@@ -135,6 +143,8 @@ class Checkpoints:
     def __init__(self, dst, shp_dir, log_dir, run, source='', allow_legacy=False):
         self.directory = Path(log_dir) / 'classification_checkpoints'
         self.shp_dir = Path(shp_dir)
+        if run.get('roi') and allow_legacy:
+            raise ValueError('启用实际落图范围后不可导入无法验证范围的旧版分类结果')
         self.run = run
         self.source = resolve_source(source, dst)
         if self.source and self.source[0].resolve() == self.shp_dir.parent.resolve():

@@ -102,6 +102,28 @@ class InferDataMgr(data.Dataset):
                     continue
                 self.index_list.append((i, j))
 
+        # Reuse the same immutable per-task footprint as change detection.
+        self.roi = None
+        self.roi_wkt = None
+        self.roi_candidates = len(self.index_list)
+        if os.environ.get('CHANGE_DETECTION_ROI_VECTOR') or os.environ.get('CHANGE_DETECTION_ROI_WKT_FILE'):
+            self._open_roi(initial=True)
+            self.index_list = [(i, j) for i, j in self.index_list
+                               if self.roi.intersects(j * self.width_crop, i * self.height_crop,
+                                   min(self.width_crop, img_width - j * self.width_crop),
+                                   min(self.height_crop, img_height - i * self.height_crop))]
+
+    def _open_roi(self, initial=False):
+        import sys
+        from pathlib import Path
+        root = str(Path(__file__).resolve().parents[4])
+        if root not in sys.path:
+            sys.path.insert(0, root)
+        from change.roi_scope import projected_wkt, RoiScope
+        if initial:
+            self.roi_wkt = projected_wkt(self.image_reader.proj)
+        self.roi = RoiScope(self.roi_wkt, self.image_reader.coord, self.image_reader.proj)
+
     def reopen_readers(self):
         """为 DataLoader worker 重新打开独立 GDAL 句柄，避免跨进程共享句柄。"""
         try:
@@ -111,6 +133,8 @@ class InferDataMgr(data.Dataset):
             pass
         self.image_reader = ImageReader(self.filename)
         self.image_reader.set_band_list(self.requested_band_list)
+        if getattr(self, 'roi_wkt', None):
+            self._open_roi()
 
         try:
             if self.mask_reader is not None:
@@ -129,6 +153,7 @@ class InferDataMgr(data.Dataset):
         state = self.__dict__.copy()
         state['image_reader'] = None
         state['mask_reader'] = None
+        state['roi'] = None
         return state
 
     def __setstate__(self, state):
@@ -234,6 +259,12 @@ class InferDataMgr(data.Dataset):
                            ' Retry ' + str(_retry) + ' times for reading ' + str(
                     self.index_list[index]) + ' in ' + self.filename)
 
+        if self.roi is not None:
+            # RGB normalization/context stay unchanged; only output validity is masked.
+            coverage = self.roi.mask(width_down, height_down, self.width, self.height)
+            img_mask = img_mask * torch.from_numpy(coverage)
+            if not np.any(coverage):
+                status = 'outside_roi'
         return img, img_mask, str(idx_i), str(idx_j), status
 
     def __len__(self):

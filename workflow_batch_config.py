@@ -13,6 +13,31 @@ SETTINGS = {
     'classification': ('classification_batch_per_gpu', 'CLIE_BATCH_PER_GPU', 8, 64),
 }
 
+CHANGE_PIPELINE_SETTINGS = {
+    'change_prefetch_threads': ('CHANGE_DETECTION_PREFETCH_THREADS', 0, 8),
+    'change_torch_threads': ('CHANGE_DETECTION_TORCH_THREADS', 1, 256),
+}
+
+
+def _apply_change_pipeline_config(config, env):
+    # Preserve inference defaults when optional fields are absent. Existing env
+    # overrides workflow values, matching batch configuration precedence.
+    for key, (env_key, minimum, maximum) in CHANGE_PIPELINE_SETTINGS.items():
+        if env_key in env:
+            value, source = env[env_key], env_key
+        elif key in config:
+            value, source = config[key], 'WF_CONFIG.config'
+        else:
+            continue
+        if (isinstance(value, bool) or not isinstance(value, (int, str))
+                or not re.fullmatch(r'[0-9]+', str(value).strip())):
+            raise ValueError('%s 必须是 %s～%s 的整数，收到 %r' % (key, minimum, maximum, value))
+        threads = int(value)
+        if not minimum <= threads <= maximum:
+            raise ValueError('%s 必须在 %s～%s 之间，收到 %s' % (key, minimum, maximum, threads))
+        env[env_key] = str(threads)
+        print('[数据供给配置] %s=%s（来源=%s）' % (key, threads, source), flush=True)
+
 
 def apply_batch_config(stage, explicit=None, environ=None):
     """CLI > existing environment > workflow config > backward-compatible default.
@@ -44,5 +69,7 @@ and checkpoint signatures use exactly the same batch. No CUDA imports needed.
     if not 1 <= batch <= maximum:
         raise ValueError('%s 必须在 1～%s 之间，收到 %s' % (key, maximum, batch))
     env[env_key] = str(batch)
+    if stage == 'change':
+        _apply_change_pipeline_config(config, env)
     print('[Batch配置] %s=%s（每张 GPU 的切片数，来源=%s）' % (key, batch, source), flush=True)
     return batch

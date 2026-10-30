@@ -447,19 +447,13 @@ def _major_class_from_counts(pixel_counts):
 
 
 def _process_chunk(args):
-    import rasterio
     from rasterstats import zonal_stats
 
     gdf_chunk, tif_file = args
-    with rasterio.open(tif_file) as src:
-        raster_data = src.read(1)
-        affine = src.transform
-        # 按真实图斑几何掩膜统计；外接矩形仅用于栅格窗口读取。
-        # 保持像元中心落入图斑的采样规则，避免细长道路纳入过多周边像元。
-        stats = zonal_stats(
-            gdf_chunk, raster_data, affine=affine,
-            categorical=True, nodata=0, all_touched=False,
-        )
+    # File-backed rasterstats reads each geometry window instead of copying a
+    # full classification raster into every statistics process.
+    stats = zonal_stats(gdf_chunk, tif_file, band=1,
+                        categorical=True, nodata=0, all_touched=False)
     major_classes = [_major_class_from_counts(stat) for stat in stats]
     return list(gdf_chunk.index), major_classes
 

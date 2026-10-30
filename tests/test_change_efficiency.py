@@ -119,8 +119,8 @@ class EfficiencyTests(unittest.TestCase):
         self.assertIn('enumerate(efficiency.iter_batches(data_loader_test))', source)
         self.assertIn('efficiency.complete_batch(batch_patches, 0)', source)
         self.assertIn('efficiency.complete_batch(batch_patches, int(output.shape[0]))', source)
-        self.assertIn('valid_indexs = [component[non_zero_mask] for component in indexs]', source)
-        self.assertIn('valid_nodata_mask = nodata_mask[non_zero_mask]', source)
+        self.assertIn('img, valid_nodata_mask, valid_indexs = pack_valid_batch(', source)
+        self.assertIn('with (data_loader_test if thread_workers else nullcontext()):', source)
 
 
 if __name__ == '__main__':

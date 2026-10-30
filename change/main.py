@@ -84,8 +84,12 @@ if __name__ == '__main__':
     parser.add_argument('--kafka_topic', type=str, required=False, default='')
     parser.add_argument('--kafka_task_id', type=str, required=False, default=None)
     parser.add_argument('--debug', action='store_true')
+    parser.add_argument('--roi_vector', default=None, help='可选批次落图范围矢量路径，须带坐标系')
     parser.add_argument('--change_batch_size', default=None, help='每卡变化检测切片 batch，1～32；默认从工作流 config 读取')
     args, unknown = parser.parse_known_args()
+    if args.roi_vector is not None:
+        os.environ['CHANGE_DETECTION_ROI_VECTOR'] = args.roi_vector
+        os.environ.pop('CHANGE_DETECTION_ROI_WKT_FILE', None)
     apply_batch_config('change', args.change_batch_size)
     args.resume_from, args.resume_allow_legacy = resolve_resume_options(
         args.resume_from, args.resume_allow_legacy)

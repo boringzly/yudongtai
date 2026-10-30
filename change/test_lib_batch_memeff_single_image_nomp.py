@@ -7,6 +7,10 @@ from pathlib import Path
 from time import sleep
 from time import perf_counter
 from inference_metrics import InferenceMetrics, change_batch_size
+from inference_pipeline import ThreadedBatchLoader, pack_valid_batch
+from contextlib import nullcontext
+from roi_scope import projected_wkt, filter_indices, RoiScope, clip_shapefile
+from torch.utils.data import default_collate
 import numpy as np
 from osgeo import gdal, ogr, osr
 from datasets.DataUtils import DataUtils
@@ -511,6 +515,8 @@ class OnlineDataset(data.Dataset):
         self.with_fft = with_fft
         self.predataset = {} # gdal.Open(self.preimg_path)
         self.postdataset = {} # gdal.Open(self.postimg_path)
+        roi_wkt = self.path_info.get('roi_wkt')
+        self.roi = RoiScope(roi_wkt, self.path_info['roi_transform'], self.path_info['roi_projection']) if roi_wkt else None
         self.band_num = band_num
         self.datautils = DataUtils()
         mean_file = self.path_info['mean_file']
@@ -525,6 +531,11 @@ class OnlineDataset(data.Dataset):
             T.ToTensor(),
             normalize
         ])
+
+    def close(self):
+        # Called only after all loading threads have stopped.
+        self.predataset.clear()
+        self.postdataset.clear()
 
     def __getstate__(self):
         """spawn 模式不继承任何已打开的 GDAL dataset。"""
@@ -609,8 +620,14 @@ class OnlineDataset(data.Dataset):
         #     post_img = cv2.resize(post_img, (pre_img.shape[1], pre_img.shape[0]), interpolation=cv2.INTER_NEAREST)
         # cv2.imwrite('./test/' + pre_name+ '.png', np.concatenate((pre_img, post_img), axis=1).astype(np.uint8))
         nodata_mask = mask_nodata(pre_img, post_img)
+        if self.roi is not None:
+            origin_x = int(self.index_list[index][0]) - self.overlap[0] // 2
+            origin_y = int(self.index_list[index][1]) - self.overlap[1] // 2
+            # Mask only validity/output; retain the original RGB context for FFT/model.
+            nodata_mask = nodata_mask * self.roi.mask(
+                origin_x, origin_y, pre_img.shape[1], pre_img.shape[0])
         # use FFT
-        if self.with_fft:
+        if self.with_fft and np.any(nodata_mask):
             pre_img = style_transfer(pre_img, post_img)
         # percentage strech
         if False:
@@ -1181,6 +1198,14 @@ def test_lib(local_rank, gpu_count, cfg, logger, progress_callback=None):
         index_list, nx, ny = generate_indexlist(big_img_width, big_img_height, ori_w=0, ori_h=0, \
                                                 subsize=(cfg.TEST_IMG_SIZE, cfg.TEST_IMG_SIZE),
                                                 overlap=(cfg.TEST_PIXEL_OVERLAP, cfg.TEST_PIXEL_OVERLAP))
+        roi_wkt = projected_wkt(proj_post)
+        if roi_wkt:
+            candidates = len(index_list)
+            index_list = filter_indices(index_list, roi_wkt, gt_post,
+                                        cfg.TEST_IMG_SIZE, cfg.TEST_PIXEL_OVERLAP)
+            if logger is not None:
+                logger.info('[范围] 候选切片=%s, 保留=%s, 范围外跳过=%s（读图/FFT之前）',
+                            candidates, len(index_list), candidates - len(index_list))
         # pack path parameters
         path_info = {
             "preImgPath": pre_namelist[n],
@@ -1189,23 +1214,46 @@ def test_lib(local_rank, gpu_count, cfg, logger, progress_callback=None):
             "clipsize": (cfg.TEST_IMG_SIZE, cfg.TEST_IMG_SIZE),
             "overlap": (cfg.TEST_PIXEL_OVERLAP, cfg.TEST_PIXEL_OVERLAP),
             "mean_file": mean_file,
-            "std_file": std_file
+            "std_file": std_file,
+            "roi_wkt": roi_wkt,
+            "roi_transform": tuple(gt_post),
+            "roi_projection": proj_post
         }
         #import ipdb;ipdb.set_trace()
         # test_dataloader
         test_data = OnlineDataset(path_info, cfg.BAND_NUM, cfg.with_fft)
-        loader_mode = 'single-process'
+        # Avoid HAMi-injected child processes; each CPU thread owns a dataset.
+        threads_default = 2 if _running_under_hami() and gpu_count > 0 else 0
+        try:
+            thread_workers = max(0, min(8, int(os.environ.get(
+                'CHANGE_DETECTION_PREFETCH_THREADS', str(threads_default)))))
+        except ValueError:
+            thread_workers = threads_default
+        if cfg.TEST_NUM_WORKERS > 0:
+            thread_workers = 0
+        # Large torch CPU thread teams are expensive for these copy/normalize ops.
+        # Leave CPU-only model inference alone; explicit values allow comparison.
+        if gpu_count > 0:
+            try:
+                cpu_threads = max(1, min(_available_cpu_count(), int(os.environ.get(
+                    'CHANGE_DETECTION_TORCH_THREADS', '4'))))
+            except ValueError:
+                cpu_threads = min(4, _available_cpu_count())
+            torch.set_num_threads(cpu_threads)
+        loader_mode = 'threads' if thread_workers else 'single-process'
         if cfg.TEST_NUM_WORKERS > 0:
             loader_mode = 'spawn'
         if logger is not None:
             logger.info(
                 'DataLoader配置: batch_size=%s, num_workers=%s, prefetch_factor=%s, '
-                'start_method=%s, persistent_workers=false, hami=%s',
+                'start_method=%s, persistent_workers=false, hami=%s, cpu_prefetch_threads=%s, torch_cpu_threads=%s',
                 cfg.TEST_BATCHES,
                 cfg.TEST_NUM_WORKERS,
                 cfg.TEST_PREFETCH_FACTOR,
                 loader_mode,
                 _running_under_hami(),
+                thread_workers,
+                torch.get_num_threads(),
             )
         dataloader_kwargs = {
             'batch_size': cfg.TEST_BATCHES,
@@ -1222,7 +1270,12 @@ def test_lib(local_rank, gpu_count, cfg, logger, progress_callback=None):
                 'worker_init_fn': _init_change_dataloader_worker,
                 'timeout': 120,
             })
-        data_loader_test = torch.utils.data.DataLoader(test_data, **dataloader_kwargs)
+        if thread_workers:
+            data_loader_test = ThreadedBatchLoader(
+                lambda: OnlineDataset(path_info, cfg.BAND_NUM, cfg.with_fft),
+                len(test_data), cfg.TEST_BATCHES, thread_workers, default_collate)
+        else:
+            data_loader_test = torch.utils.data.DataLoader(test_data, **dataloader_kwargs)
         # create result file
 
         driver = gdal.GetDriverByName('GTiff')
@@ -1248,92 +1301,88 @@ def test_lib(local_rank, gpu_count, cfg, logger, progress_callback=None):
         # pre_img, post_img, nodata_mask, indexs = None, None, None, None
 
         efficiency.start_loop(total_patches)
-        for idx, (pre_img, post_img, nodata_mask, indexs) in enumerate(efficiency.iter_batches(data_loader_test)):
-            prepare_started = perf_counter()
-            batch_patches = int(nodata_mask.size(0))
-            # 跳过无效数据
-            non_zero_mask = nodata_mask.view(nodata_mask.size(0), -1).abs().sum(dim=1) != 0
-            if non_zero_mask.sum() == 0:
+        with (data_loader_test if thread_workers else nullcontext()):
+            for idx, (pre_img, post_img, nodata_mask, indexs) in enumerate(efficiency.iter_batches(data_loader_test)):
+                prepare_started = perf_counter()
+                batch_patches = int(nodata_mask.size(0))
+                # 跳过无效数据
+                img, valid_nodata_mask, valid_indexs = pack_valid_batch(
+                    pre_img, post_img, nodata_mask, indexs)
+                if img.shape[0] == 0:
+                    efficiency.add('prepare', prepare_started)
+                    efficiency.complete_batch(batch_patches, 0)
+                    processed_patches += batch_patches
+                    if local_rank == 0:
+                        pbar.update(batch_patches)
+                        if progress_callback is not None and total_patches > 0:
+                            progress_callback(processed_patches, total_patches)
+                    continue
                 efficiency.add('prepare', prepare_started)
-                efficiency.complete_batch(batch_patches, 0)
+                inference_started = perf_counter()
+                if cfg.WITH_TTA:
+                    img90 = np.array(np.rot90(img, axes=(2, 3)))  # rotate 90
+                    img1 = np.ascontiguousarray(np.concatenate([img, img90]), dtype=np.float32)  # concat raw and rot90
+                    img2 = np.ascontiguousarray(np.array(img1)[:, :, ::-1], dtype=np.float32)
+                    img3 = np.ascontiguousarray(np.array(img1)[:, :, :, ::-1], dtype=np.float32)
+                    img4 = np.ascontiguousarray(np.array(img2)[:, :, :, ::-1], dtype=np.float32)
+                    images = np.ascontiguousarray(np.concatenate([img1, img2, img3, img4]), dtype=np.float32)
+                    output = test_with_TTA(net, images, cfg.MODEL_NUM_CLASSES, device)
+                    if net2 is not None:
+                        output2 = test_with_TTA(net2, images, cfg.MODEL_NUM_CLASSES, device)
+                else:
+                    output = test_normal(net, img, cfg.MODEL_NUM_CLASSES, device)  # (b,h,w)
+                    if net2 is not None:
+                        output2 = test_normal(net2, img, cfg.MODEL_NUM_CLASSES, device)
+                if net2 is not None:
+                    output = np.bitwise_or(output, output2)
+                # test_normal/test_with_TTA return CPU numpy arrays, so GPU results
+                # are already synchronized here; do not add a device-wide barrier.
+                efficiency.add('inference', inference_started)
+                write_started = perf_counter()
+                for i in range(output.shape[0]):
+                    # maskout nodata area
+                    pred = output[i] * valid_nodata_mask[i].astype(output[i].dtype)
+                    clip_x, clip_y, pad_x, pad_y = (
+                        valid_indexs[0][i],
+                        valid_indexs[1][i],
+                        valid_indexs[2][i],
+                        valid_indexs[3][i],
+                    )
+                    overlap_half = cfg.TEST_PIXEL_OVERLAP // 2
+                    if pad_x == -1:
+                        pred = pred[:, overlap_half:]
+                    elif pad_x == 0 and overlap_half > 0:
+                        pred = pred[:, overlap_half:-overlap_half]
+                    elif pad_x == 0 and overlap_half == 0:
+                        pass
+                    else:
+                        pred = pred[:, overlap_half:-int(pad_x)]
+
+                    if pad_y == -1:
+                        pred = pred[overlap_half:, :]
+                    elif pad_y == 0 and overlap_half > 0:
+                        pred = pred[overlap_half:-overlap_half, :]
+                    elif pad_y == 0 and overlap_half == 0:
+                        pass
+                    else:
+                        pred = pred[overlap_half:-int(pad_y), :]
+                    _band = out_data.GetRasterBand(1)
+                    gdal.ErrorReset()
+                    write_result = _band.WriteArray(pred, int(clip_x), int(clip_y))
+                    flush_result = _band.FlushCache()
+                    if (write_result not in (None, 0)
+                            or flush_result not in (None, 0)
+                            or gdal.GetLastErrorType() >= gdal.CE_Failure):
+                        error_message = gdal.GetLastErrorMsg() or 'unknown GDAL error'
+                        raise RuntimeError(f'写入变化检测 BigTIFF 失败: {error_message}')
+                efficiency.add('write', write_started)
+                efficiency.complete_batch(batch_patches, int(output.shape[0]))
                 processed_patches += batch_patches
                 if local_rank == 0:
                     pbar.update(batch_patches)
                     if progress_callback is not None and total_patches > 0:
+                        # 按真实切片数汇报；多卡 batch>1 时进度与 ETA 仍保持准确。
                         progress_callback(processed_patches, total_patches)
-                continue
-            pre_img = pre_img[non_zero_mask]
-            post_img = post_img[non_zero_mask]
-            valid_nodata_mask = nodata_mask[non_zero_mask]
-            valid_indexs = [component[non_zero_mask] for component in indexs]
-
-            img = np.concatenate((pre_img, post_img), 1)
-            efficiency.add('prepare', prepare_started)
-            inference_started = perf_counter()
-            if cfg.WITH_TTA:
-                img90 = np.array(np.rot90(img, axes=(2, 3)))  # rotate 90
-                img1 = np.ascontiguousarray(np.concatenate([img, img90]), dtype=np.float32)  # concat raw and rot90
-                img2 = np.ascontiguousarray(np.array(img1)[:, :, ::-1], dtype=np.float32)
-                img3 = np.ascontiguousarray(np.array(img1)[:, :, :, ::-1], dtype=np.float32)
-                img4 = np.ascontiguousarray(np.array(img2)[:, :, :, ::-1], dtype=np.float32)
-                images = np.ascontiguousarray(np.concatenate([img1, img2, img3, img4]), dtype=np.float32)
-                output = test_with_TTA(net, images, cfg.MODEL_NUM_CLASSES, device)
-                if net2 is not None:
-                    output2 = test_with_TTA(net2, images, cfg.MODEL_NUM_CLASSES, device)
-            else:
-                output = test_normal(net, img, cfg.MODEL_NUM_CLASSES, device)  # (b,h,w)
-                if net2 is not None:
-                    output2 = test_normal(net2, img, cfg.MODEL_NUM_CLASSES, device)
-            if net2 is not None:
-                output = np.bitwise_or(output, output2)
-            # test_normal/test_with_TTA return CPU numpy arrays, so GPU results
-            # are already synchronized here; do not add a device-wide barrier.
-            efficiency.add('inference', inference_started)
-            write_started = perf_counter()
-            for i in range(output.shape[0]):
-                # maskout nodata area
-                pred = output[i] * valid_nodata_mask[i].numpy().astype(output[i].dtype)
-                clip_x, clip_y, pad_x, pad_y = (
-                    valid_indexs[0][i],
-                    valid_indexs[1][i],
-                    valid_indexs[2][i],
-                    valid_indexs[3][i],
-                )
-                overlap_half = cfg.TEST_PIXEL_OVERLAP // 2
-                if pad_x == -1:
-                    pred = pred[:, overlap_half:]
-                elif pad_x == 0 and overlap_half > 0:
-                    pred = pred[:, overlap_half:-overlap_half]
-                elif pad_x == 0 and overlap_half == 0:
-                    pass
-                else:
-                    pred = pred[:, overlap_half:-int(pad_x)]
-
-                if pad_y == -1:
-                    pred = pred[overlap_half:, :]
-                elif pad_y == 0 and overlap_half > 0:
-                    pred = pred[overlap_half:-overlap_half, :]
-                elif pad_y == 0 and overlap_half == 0:
-                    pass
-                else:
-                    pred = pred[overlap_half:-int(pad_y), :]
-                _band = out_data.GetRasterBand(1)
-                gdal.ErrorReset()
-                write_result = _band.WriteArray(pred, int(clip_x.data), int(clip_y.data))
-                flush_result = _band.FlushCache()
-                if (write_result not in (None, 0)
-                        or flush_result not in (None, 0)
-                        or gdal.GetLastErrorType() >= gdal.CE_Failure):
-                    error_message = gdal.GetLastErrorMsg() or 'unknown GDAL error'
-                    raise RuntimeError(f'写入变化检测 BigTIFF 失败: {error_message}')
-            efficiency.add('write', write_started)
-            efficiency.complete_batch(batch_patches, int(output.shape[0]))
-            processed_patches += batch_patches
-            if local_rank == 0:
-                pbar.update(batch_patches)
-                if progress_callback is not None and total_patches > 0:
-                    # 按真实切片数汇报；多卡 batch>1 时进度与 ETA 仍保持准确。
-                    progress_callback(processed_patches, total_patches)
         efficiency.report('切片循环结束')
         overview_started = perf_counter()
         build_overviews(out_data)
@@ -1418,6 +1467,8 @@ def test_lib(local_rank, gpu_count, cfg, logger, progress_callback=None):
         fill_hole(out_shp_namelist[0], fill_hole_shp)
         output_shp = out_shp_namelist1[0]
         smooth_polygons_gdf_used(fill_hole_shp, output_shp)
+        if roi_wkt:
+            clip_shapefile(output_shp, roi_wkt, proj_post)
         if logger is not None:
             logger.info('矢量优化完成')
         efficiency.phase_done('矢量填洞及平滑', smooth_started)

@@ -76,3 +76,36 @@ CLI 分别为 `--change_batch_size`、`--classification_batch_per_gpu`。
 
 参考：[PyTorch Performance Tuning Guide](https://docs.pytorch.org/tutorials/recipes/recipes/tuning_guide.html)
 说明提高 batch 可以改善GPU利用率，但是否加速应以实际吞吐为准。
+
+
+## 变化检测 CPU 预取线程
+
+CIS 后台的普通任务和图节点任务已通过 `WF_CONFIG` 传入完整工作流 JSON，
+无需改 Java Job 创建逻辑或另加 Kubernetes 环境变量。发布新版算法代码后，
+可直接在原工作流顶层 config 设置：
+
+```json
+"config": {
+    "fast_run": true,
+    "change_batch_size": 16,
+    "classification_batch_per_gpu": 16,
+    "change_prefetch_threads": 4,
+    "change_torch_threads": 4,
+    "resume_from": "",
+    "resume_allow_legacy": false,
+    "classification_resume_from": "",
+    "classification_resume_allow_legacy": false
+}
+```
+
+- `change_prefetch_threads` → `CHANGE_DETECTION_PREFETCH_THREADS`，0～8；0 关闭线程预取。
+- `change_torch_threads` → `CHANGE_DETECTION_TORCH_THREADS`，1～256；实际值再受容器可用 CPU 数限制。
+- 环境变量优先于工作流 config；未配置时保留算法原默认值。
+- 只在变化检测入口解析，随后由 GPU 子进程继承。分类不应用这两个设置。
+- 普通多进程 DataLoader 不叠加线程预取；HAMi 下保持 num_workers=0，
+  `start_method=threads`、`cpu_prefetch_threads=4` 才表示线程模式已启用。
+- 对比 2、4、8 个预取线程时，固定同一对影像、模型与 batch=16，检查输出和端到端耗时。
+- 这是新任务启动配置；不会热更新正在运行的 Pod，也不需要重生成 TIFF。
+
+必须同时发布根目录 `workflow_batch_config.py` 及变化检测预取优化文件；旧算法不会读取这些新字段。
+启动日志 `[数据供给配置]` 显示配置值与来源，`DataLoader配置` 显示实际加载模式和 CPU 线程数。

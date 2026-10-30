@@ -821,6 +821,9 @@ def infer(kwargs):
                     f.write('[WARNING] ' + time.strftime('[%y%m%d_%H:%M:%S]') + '  Skip predicting ' + filename)
             continue
 
+        if getattr(test_data, 'roi_wkt', None):
+            logger.info('[范围] 分类候选切片=%s, 保留=%s, 范围外跳过=%s（读图之前）' % (
+                test_data.roi_candidates, len(test_data), test_data.roi_candidates - len(test_data)))
         dataloader_kwargs = {
             'batch_size': cfg.TEST_BATCHES,
             'shuffle': False,

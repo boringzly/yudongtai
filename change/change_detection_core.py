@@ -321,6 +321,61 @@ def _is_dataloader_worker_failure(error):
             or 'dataloader timed out' in message)
 
 
+def _configure_change_memory(logger):
+    """Bound GDAL's per-process block cache on every grid/read path."""
+    from osgeo import gdal
+    workflow = json.loads(os.environ.get('WF_CONFIG') or '{}')
+    config = workflow.get('config', {})
+    value = os.environ.get('CHANGE_DETECTION_GDAL_CACHE_MB', config.get('change_gdal_cache_mb', 512))
+    if isinstance(value, bool) or not str(value).isdigit() or not 64 <= int(value) <= 4096:
+        raise ValueError('change_gdal_cache_mb 必须为 64～4096 的整数 MiB')
+    previous = gdal.GetCacheMax()
+    gdal.SetCacheMax(int(value) * 1024 * 1024)
+    logger.info('[内存配置] GDAL缓存上限=%.0fMiB（原上限=%.0fMiB；覆盖网格一致/裁切/重采样路径）',
+                gdal.GetCacheMax() / 1024 ** 2, previous / 1024 ** 2)
+
+
+def _change_memory_snapshot(proc_root=Path('/proc'), cgroup_root=Path('/sys/fs/cgroup')):
+    result = {}
+    try:
+        for line in (proc_root / 'self/status').read_text().splitlines():
+            if line.startswith(('VmRSS:', 'VmHWM:')):
+                key, value = line.split(':', 1)
+                result[key] = int(value.split()[0]) * 1024
+    except (OSError, ValueError):
+        pass
+    for key, candidates in (
+        ('current', ('memory.current', 'memory/memory.usage_in_bytes')),
+        ('limit', ('memory.max', 'memory/memory.limit_in_bytes')),
+    ):
+        for name in candidates:
+            try:
+                value = (cgroup_root / name).read_text().strip()
+                if value != 'max':
+                    value = int(value)
+                    if value < 2 ** 60:
+                        result[key] = value
+                break
+            except (OSError, ValueError):
+                continue
+    return result
+
+
+def _log_change_memory(logger, phase):
+    """Observe resident/cgroup RAM separately from CUDA memory; never abort inference."""
+    try:
+        from osgeo import gdal
+        values = _change_memory_snapshot()
+        def gib(name):
+            value = values.get(name)
+            return 'N/A' if value is None else '%.2fGiB' % (value / 1024 ** 3)
+        logger.info('[内存] %s | 进程RSS=%s, 峰值RSS=%s, 容器用量=%s, 容器上限=%s, GDAL缓存=%.0f/%.0fMiB',
+                    phase, gib('VmRSS'), gib('VmHWM'), gib('current'), gib('limit'),
+                    gdal.GetCacheUsed() / 1024 ** 2, gdal.GetCacheMax() / 1024 ** 2)
+    except Exception as error:
+        logger.debug('内存采样不可用: %s', error)
+
+
 def _change_pair_worker(task_queue, event_queue, staging_lock, gpu_slot, parallel_jobs):
     """一个进程独占一张 GPU，持续领取影像对执行推理。"""
     # If the task parent disappears, do not leave an orphan holding CUDA/HAMi
@@ -389,6 +444,8 @@ def _process_change_pair(task, event_queue, staging_lock, worker_label):
     pair_scratch_dir = None
     result = None
     try:
+        _configure_change_memory(logger)
+        _log_change_memory(logger, '影像开始')
         # 必须在 CUDA_VISIBLE_DEVICES 设置完成后导入，确保本进程只看到绑定的卡。
         from test_lib_batch_memeff_single_image_nomp import test_lib_big_memeff
         from resume_checkpoint import invalidate, save_checkpoint
@@ -440,12 +497,16 @@ def _process_change_pair(task, event_queue, staging_lock, worker_label):
         active_tif_path = os.path.join(os.path.dirname(run_output_shp), f'{stem}.tif')
         inference_started_at = time.monotonic()
         last_report_at = [0.0]
+        last_memory_report_at = [0.0]
 
         def _progress_callback(current, total_patches):
             now = time.monotonic()
             if current < total_patches and now - last_report_at[0] < 5:
                 return
             last_report_at[0] = now
+            if now - last_memory_report_at[0] >= 30:
+                _log_change_memory(logger, '切片 %s/%s' % (current, total_patches))
+                last_memory_report_at[0] = now
             inference_elapsed = max(now - inference_started_at, 0.001)
             pair_eta = inference_elapsed / max(current, 1) * max(total_patches - current, 0)
             tif_size = os.path.getsize(active_tif_path) if os.path.isfile(active_tif_path) else 0
@@ -570,6 +631,7 @@ def _process_change_pair(task, event_queue, staging_lock, worker_label):
         except Exception:
             pass
 
+    _log_change_memory(logger, '影像清理后')
     event_queue.put(result)
 
 
@@ -608,6 +670,8 @@ def change_detection(pre_image, post_image, model_path, dst_path, output_dataset
     from test_lib_batch_memeff_single_image_nomp import test_lib_big_memeff
     logger, log_path = _configure_persistent_logger('change_detection', dst_path)
     logger.info('持久化日志: %s', log_path)
+    _configure_change_memory(logger)
+    _log_change_memory(logger, '单图开始')
 
     def _cd_progress(current, total):
         pct = prg_sender.calc_progress_value(current, total, 15, 90)
@@ -732,6 +796,8 @@ def change_detection_folder(pre_folder, post_folder, model_path, dst_path, outpu
     checkpoint_dir = os.path.join(_ensure_log_dir(dst_path), 'change_detection_checkpoints')
     logger.info('正在建立续跑指纹（模型及推理代码校验）')
     run = run_identity(model_path, use_two_models, second_model_path)
+    if run.get('roi') and resume_allow_legacy:
+        raise ValueError('启用实际落图范围后不可导入无法验证范围的旧版结果，请关闭 resume_allow_legacy')
     source = resolve_source(resume_from, dst_path)
     if source and Path(source[0]).resolve() == Path(dst_path).resolve() and resume_allow_legacy:
         raise ValueError('旧日志导入必须写入新的任务目录，不能覆盖旧任务')

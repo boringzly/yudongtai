@@ -34,6 +34,10 @@ def run_identity(model_path, use_two_models, second_model_path):
     # Hash inference dependencies, not orchestration/logging, so progress fixes
     # don't invalidate predictions. Any algorithm/config change must invalidate.
     sources = [root / 'test_lib_batch_memeff_single_image_nomp.py']
+    if (root / 'inference_pipeline.py').is_file():
+        sources.append(root / 'inference_pipeline.py')
+    if (root / 'roi_scope.py').is_file():
+        sources.append(root / 'roi_scope.py')
     for directory in ('networks', 'utils'):
         sources.extend(sorted((root / directory).rglob('*.py')))
         sources.extend(sorted((root / directory).rglob('*.so')))
@@ -49,8 +53,12 @@ def run_identity(model_path, use_two_models, second_model_path):
     if use_two_models:
         models.append(digest(resolve_model(second_model_path, 'FBCD_test_Levir_CD_best_acc.pth')))
     from inference_metrics import change_batch_size
+    roi = None
+    if os.environ.get('CHANGE_DETECTION_ROI_VECTOR') or os.environ.get('CHANGE_DETECTION_ROI_WKT_FILE'):
+        from roi_scope import fingerprint
+        roi = fingerprint()
     return {'schema': 1, 'models': models, 'dual': bool(use_two_models),
-            'algorithm': code.hexdigest(), 'batch_size': change_batch_size()}
+            'algorithm': code.hexdigest(), 'batch_size': change_batch_size(), 'roi': roi}
 
 
 def resolve_model(requested, fallback):
