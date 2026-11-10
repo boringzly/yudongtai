@@ -59,7 +59,7 @@ class ImageReader():
 
 class ImageWriter():
 
-    def __init__(self, filename, width, height, nbands, dtype='uint8', driver='GTiff', compress=None):
+    def __init__(self, filename, width, height, nbands, dtype='uint8', driver='GTiff', compress=None, flush_each_write=True):
         type_dict = {
             'uint8': gdal.GDT_Byte,
             'uint16': gdal.GDT_UInt16,
@@ -93,6 +93,7 @@ class ImageWriter():
             raise RuntimeError(f'Failed to create raster {filename}: {error_message}')
 
         self.filename = filename
+        self.flush_each_write = bool(flush_each_write)
         self.width = width
         self.height = height
         self.nbands = nbands
@@ -137,21 +138,30 @@ class ImageWriter():
             _band = self.dataset.GetRasterBand(i + 1)
             gdal.ErrorReset()
             write_result = _band.WriteArray(img[:, :, band - 1], *write_offset)
-            flush_result = _band.FlushCache()
+            flush_result = _band.FlushCache() if self.flush_each_write else None
             if (write_result not in (None, 0)
                     or flush_result not in (None, 0)
                     or gdal.GetLastErrorType() >= gdal.CE_Failure):
                 error_message = gdal.GetLastErrorMsg() or 'unknown GDAL error'
                 raise RuntimeError(f'Failed to write raster {self.filename}: {error_message}')
 
-    def close(self):
+    def _flush(self, phase):
         if self.dataset is None:
             return
         gdal.ErrorReset()
         flush_result = self.dataset.FlushCache()
         if flush_result not in (None, 0) or gdal.GetLastErrorType() >= gdal.CE_Failure:
             error_message = gdal.GetLastErrorMsg() or 'unknown GDAL error'
-            raise RuntimeError(f'Failed to finalize raster {self.filename}: {error_message}')
+            raise RuntimeError(f'Failed to {phase} raster {self.filename}: {error_message}')
+
+    def flush(self):
+        """Called after a complete classification batch; errors remain fatal."""
+        self._flush('flush')
+
+    def close(self):
+        if self.dataset is None:
+            return
+        self._flush('finalize')
         self.dataset = None
 
     def build_overviews(self, overviewlist=[2,4,8,16,32,64,128]):

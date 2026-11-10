@@ -165,40 +165,77 @@ def polygonal_part(geometry):
     return result if result.GetGeometryCount() else None
 
 
-def clip_shapefile(path, wkt, projection):
-    """Reapply the precise boundary after filling/smoothing can expand polygons."""
+def _valid_polygonal(geometry, context):
+    """Repair invalid polygon topology; never silently drop an unrepairable area."""
+    if geometry is None or geometry.IsEmpty():
+        raise RuntimeError('Missing or empty geometry: ' + context)
+    repaired = not geometry.IsValid()
+    if repaired:
+        if not hasattr(geometry, 'MakeValid'):
+            raise RuntimeError('GDAL MakeValid unavailable: ' + context)
+        geometry = geometry.MakeValid()
+        if geometry is None:
+            raise RuntimeError('Geometry MakeValid failed: ' + context)
+    geometry = polygonal_part(geometry)
+    if geometry is None or geometry.IsEmpty() or not geometry.IsValid():
+        raise RuntimeError('No valid polygon after geometry repair: ' + context)
+    return geometry, repaired
+
+
+def clip_shapefile(path, wkt, projection, logger=None):
+    """Clip repaired output polygons to exact coverage, preserving attributes."""
     from osgeo import ogr, osr
     dataset = ogr.Open(str(path), 1)
     if dataset is None:
         raise RuntimeError('Cannot open output for ROI clipping: ' + str(path))
-    layer = dataset.GetLayer(0)
-    target = layer.GetSpatialRef()
-    if target is None:
-        raise ValueError('Output vector CRS missing during ROI clipping')
-    target = target.Clone()
-    target.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
-    origin = osr.SpatialReference()
-    origin.ImportFromWkt(projection)
-    origin.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
-    geometry = _polygon(ogr.CreateGeometryFromWkt(wkt))
-    if not origin.IsSame(target):
-        if geometry.Transform(osr.CoordinateTransformation(origin, target)) != 0:
-            raise RuntimeError('Cannot transform ROI to output CRS')
-    identifiers = [feature.GetFID() for feature in layer]
-    for identifier in identifiers:
-        feature = layer.GetFeature(identifier)
-        original = feature.GetGeometryRef()
-        clipped = original.Intersection(geometry) if original else None
-        if clipped is None:
-            raise RuntimeError('Output geometry intersection failed')
-        clipped = polygonal_part(clipped)
-        if clipped is None or clipped.IsEmpty():
-            if layer.DeleteFeature(identifier) != 0:
-                raise RuntimeError('Cannot remove output outside ROI')
-        else:
-            feature.SetGeometry(clipped)
-            if layer.SetFeature(feature) != 0:
-                raise RuntimeError('Cannot write ROI-clipped output')
-    if layer.SyncToDisk() != 0:
-        raise RuntimeError('Cannot flush ROI-clipped output')
-    layer, dataset = None, None
+    layer = feature = None
+    repaired = removed = written = 0
+    try:
+        layer = dataset.GetLayer(0)
+        target = layer.GetSpatialRef() if layer is not None else None
+        if target is None:
+            raise ValueError('Output vector CRS missing during ROI clipping')
+        target = target.Clone()
+        target.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+        origin = osr.SpatialReference()
+        if origin.ImportFromWkt(projection) != 0:
+            raise ValueError('Invalid raster CRS during ROI clipping')
+        origin.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+        geometry = _polygon(ogr.CreateGeometryFromWkt(wkt))
+        if not origin.IsSame(target):
+            if geometry.Transform(osr.CoordinateTransformation(origin, target)) != 0:
+                raise RuntimeError('Cannot transform ROI to output CRS')
+        geometry, roi_repaired = _valid_polygonal(geometry, 'ROI after CRS transformation')
+        identifiers = [item.GetFID() for item in layer]
+        for identifier in identifiers:
+            feature = layer.GetFeature(identifier)
+            original = feature.GetGeometryRef() if feature is not None else None
+            original, changed = _valid_polygonal(original, 'output FID=%s' % identifier)
+            repaired += int(changed)
+            try:
+                clipped = original.Intersection(geometry)
+            except RuntimeError as exc:
+                raise RuntimeError('Output geometry intersection failed at FID=%s: %s' % (identifier, exc)) from exc
+            if clipped is None:
+                raise RuntimeError('Output geometry intersection failed at FID=%s' % identifier)
+            clipped = polygonal_part(clipped)
+            if clipped is None or clipped.IsEmpty():
+                feature = None
+                if layer.DeleteFeature(identifier) != 0:
+                    raise RuntimeError('Cannot remove output outside ROI at FID=%s' % identifier)
+                removed += 1
+            else:
+                clipped, changed = _valid_polygonal(clipped, 'clipped FID=%s' % identifier)
+                repaired += int(changed)
+                if feature.SetGeometry(clipped) not in (None, 0) or layer.SetFeature(feature) != 0:
+                    raise RuntimeError('Cannot write ROI-clipped output at FID=%s' % identifier)
+                written += 1
+                feature = None
+        if layer.SyncToDisk() != 0:
+            raise RuntimeError('Cannot flush ROI-clipped output')
+        if logger:
+            logger.info('[范围修复] %s | 几何修复次数=%s, 范围修复=%s, 保留=%s, 范围外移除=%s',
+                        Path(path).name, repaired, int(roi_repaired), written, removed)
+        return {'repairs': repaired, 'roi_repaired': roi_repaired, 'written': written, 'removed': removed}
+    finally:
+        feature, layer, dataset = None, None, None

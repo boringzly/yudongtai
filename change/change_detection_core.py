@@ -447,7 +447,7 @@ def _process_change_pair(task, event_queue, staging_lock, worker_label):
         _configure_change_memory(logger)
         _log_change_memory(logger, '影像开始')
         # 必须在 CUDA_VISIBLE_DEVICES 设置完成后导入，确保本进程只看到绑定的卡。
-        from test_lib_batch_memeff_single_image_nomp import test_lib_big_memeff
+        from test_lib_batch_memeff_single_image_nomp import test_lib_big_memeff, finish_change_vectors
         from resume_checkpoint import invalidate, save_checkpoint
 
         invalidate(task['checkpoint_dir'], stem)
@@ -458,130 +458,145 @@ def _process_change_pair(task, event_queue, staging_lock, worker_label):
         _remove_file_if_exists(shared_tif_src)
         _remove_file_if_exists(tif_dst)
 
-        run_pre_path = str(pre_path)
-        run_post_path = str(post_path)
-        run_output_shp = output_shp
-        try:
-            # 空间检查和实际复制放在同一把跨进程锁内，避免两个 GPU 任务同时
-            # 看到相同的剩余空间后共同突破 Pod 的 ephemeral-storage 限制。
-            with staging_lock:
-                pair_scratch_dir = _create_local_pair_scratch(pre_path, post_path)
-                local_pre_dir = os.path.join(pair_scratch_dir, 'input', 'pre')
-                local_post_dir = os.path.join(pair_scratch_dir, 'input', 'post')
-                local_output_dir = os.path.join(pair_scratch_dir, 'output')
-                os.makedirs(local_pre_dir, exist_ok=True)
-                os.makedirs(local_post_dir, exist_ok=True)
-                os.makedirs(local_output_dir, exist_ok=True)
-                run_pre_path = os.path.join(local_pre_dir, pre_path.name)
-                run_post_path = os.path.join(local_post_dir, post_path.name)
-                run_output_shp = os.path.join(local_output_dir, f'{stem}.shp')
-
-                logger.info('复制前时相影像到本地: %s -> %s', pre_path, run_pre_path)
-                shutil.copy2(str(pre_path), run_pre_path)
-                logger.info('复制后时相影像到本地: %s -> %s', post_path, run_post_path)
-                shutil.copy2(str(post_path), run_post_path)
-                logger.info('本地暂存完成，工作目录: %s', pair_scratch_dir)
-        except Exception as staging_error:
-            if pair_scratch_dir is not None:
-                shutil.rmtree(pair_scratch_dir, ignore_errors=True)
-            pair_scratch_dir = None
+        from postprocess_checkpoint import load as load_postprocess, save as save_postprocess
+        postprocess_dir = os.path.join(os.path.dirname(task['checkpoint_dir']), 'change_detection_postprocess')
+        postprocess_context = {'directory': postprocess_dir, 'stem': stem,
+                               'identity': task['checkpoint_identity']}
+        sources = [postprocess_dir] + task.get('postprocess_sources', [])
+        stage = load_postprocess(sources, stem, task['checkpoint_identity'], logger=logger)
+        if stage is not None:
+            if Path(postprocess_dir).resolve() not in Path(stage['raw_path']).resolve().parents:
+                save_postprocess(postprocess_dir, stem, task['checkpoint_identity'],
+                                 stage['raw_path'], stage['roi_wkt'], stage['projection'])
+                logger.info('[后处理续跑] 已将 %s 的恢复点保存到当前任务', stem)
+            logger.info('[后处理续跑] 复用 %s 的原始矢量，仅执行填洞、平滑和范围裁切，不重跑模型', stem)
+            finish_change_vectors(stage['raw_path'], output_shp, stage['roi_wkt'], stage['projection'], logger)
+        else:
             run_pre_path = str(pre_path)
             run_post_path = str(post_path)
             run_output_shp = output_shp
-            logger.warning(
-                '本地暂存不可用，回退到共享盘直接处理: %s',
-                staging_error,
-                exc_info=True,
-            )
+            try:
+                # 空间检查和实际复制放在同一把跨进程锁内，避免两个 GPU 任务同时
+                # 看到相同的剩余空间后共同突破 Pod 的 ephemeral-storage 限制。
+                with staging_lock:
+                    pair_scratch_dir = _create_local_pair_scratch(pre_path, post_path)
+                    local_pre_dir = os.path.join(pair_scratch_dir, 'input', 'pre')
+                    local_post_dir = os.path.join(pair_scratch_dir, 'input', 'post')
+                    local_output_dir = os.path.join(pair_scratch_dir, 'output')
+                    os.makedirs(local_pre_dir, exist_ok=True)
+                    os.makedirs(local_post_dir, exist_ok=True)
+                    os.makedirs(local_output_dir, exist_ok=True)
+                    run_pre_path = os.path.join(local_pre_dir, pre_path.name)
+                    run_post_path = os.path.join(local_post_dir, post_path.name)
+                    run_output_shp = os.path.join(local_output_dir, f'{stem}.shp')
 
-        active_tif_path = os.path.join(os.path.dirname(run_output_shp), f'{stem}.tif')
-        inference_started_at = time.monotonic()
-        last_report_at = [0.0]
-        last_memory_report_at = [0.0]
+                    logger.info('复制前时相影像到本地: %s -> %s', pre_path, run_pre_path)
+                    shutil.copy2(str(pre_path), run_pre_path)
+                    logger.info('复制后时相影像到本地: %s -> %s', post_path, run_post_path)
+                    shutil.copy2(str(post_path), run_post_path)
+                    logger.info('本地暂存完成，工作目录: %s', pair_scratch_dir)
+            except Exception as staging_error:
+                if pair_scratch_dir is not None:
+                    shutil.rmtree(pair_scratch_dir, ignore_errors=True)
+                pair_scratch_dir = None
+                run_pre_path = str(pre_path)
+                run_post_path = str(post_path)
+                run_output_shp = output_shp
+                logger.warning(
+                    '本地暂存不可用，回退到共享盘直接处理: %s',
+                    staging_error,
+                    exc_info=True,
+                )
 
-        def _progress_callback(current, total_patches):
-            now = time.monotonic()
-            if current < total_patches and now - last_report_at[0] < 5:
-                return
-            last_report_at[0] = now
-            if now - last_memory_report_at[0] >= 30:
-                _log_change_memory(logger, '切片 %s/%s' % (current, total_patches))
-                last_memory_report_at[0] = now
-            inference_elapsed = max(now - inference_started_at, 0.001)
-            pair_eta = inference_elapsed / max(current, 1) * max(total_patches - current, 0)
-            tif_size = os.path.getsize(active_tif_path) if os.path.isfile(active_tif_path) else 0
-            estimated_tif_size = int(tif_size / max(current, 1) * total_patches)
-            event_queue.put({
-                'type': 'progress',
-                'idx': idx,
-                'stem': stem,
-                'worker': worker_label,
-                'current': current,
-                'total_patches': total_patches,
-                'pair_eta': pair_eta,
-                'pair_estimated_total': inference_elapsed + pair_eta,
-                'tif_size': tif_size,
-                'estimated_tif_size': estimated_tif_size,
-            })
+            active_tif_path = os.path.join(os.path.dirname(run_output_shp), f'{stem}.tif')
+            inference_started_at = time.monotonic()
+            last_report_at = [0.0]
+            last_memory_report_at = [0.0]
 
-        temp_dir_suffix = f'tmp_{idx}_{os.getpid()}'
+            def _progress_callback(current, total_patches):
+                now = time.monotonic()
+                if current < total_patches and now - last_report_at[0] < 5:
+                    return
+                last_report_at[0] = now
+                if now - last_memory_report_at[0] >= 30:
+                    _log_change_memory(logger, '切片 %s/%s' % (current, total_patches))
+                    last_memory_report_at[0] = now
+                inference_elapsed = max(now - inference_started_at, 0.001)
+                pair_eta = inference_elapsed / max(current, 1) * max(total_patches - current, 0)
+                tif_size = os.path.getsize(active_tif_path) if os.path.isfile(active_tif_path) else 0
+                estimated_tif_size = int(tif_size / max(current, 1) * total_patches)
+                event_queue.put({
+                    'type': 'progress',
+                    'idx': idx,
+                    'stem': stem,
+                    'worker': worker_label,
+                    'current': current,
+                    'total_patches': total_patches,
+                    'pair_eta': pair_eta,
+                    'pair_estimated_total': inference_elapsed + pair_eta,
+                    'tif_size': tif_size,
+                    'estimated_tif_size': estimated_tif_size,
+                })
 
-        def _run_inference(dataloader_workers=None, retry=False):
-            test_lib_big_memeff(
-                pre_img_path=run_pre_path,
-                post_img_path=run_post_path,
-                output_path=run_output_shp,
-                logger=logger,
-                callback_url=None,
-                job_id=None,
-                temp_dir_suffix=(temp_dir_suffix + '_retry') if retry else temp_dir_suffix,
-                progress_callback=_progress_callback,
-                model_path=task['model_path'],
-                use_two_models=task['use_two_models'],
-                second_model_path=task['second_model_path'],
-                dataloader_workers=dataloader_workers,
-            )
+            temp_dir_suffix = f'tmp_{idx}_{os.getpid()}'
 
-        try:
-            _run_inference()
-        except RuntimeError as inference_error:
-            if not _is_dataloader_worker_failure(inference_error):
-                raise
+            def _run_inference(dataloader_workers=None, retry=False):
+                test_lib_big_memeff(
+                    pre_img_path=run_pre_path,
+                    post_img_path=run_post_path,
+                    output_path=run_output_shp,
+                    logger=logger,
+                    callback_url=None,
+                    job_id=None,
+                    temp_dir_suffix=(temp_dir_suffix + '_retry') if retry else temp_dir_suffix,
+                    progress_callback=_progress_callback,
+                    model_path=task['model_path'],
+                    use_two_models=task['use_two_models'],
+                    second_model_path=task['second_model_path'],
+                    dataloader_workers=dataloader_workers,
+                    postprocess_checkpoint=postprocess_context,
+                )
 
-            logger.warning(
-                'DataLoader worker 异常退出，清理本次未完成输出并以 num_workers=0 重试: %s',
-                inference_error,
-            )
-            # Keep the fallback for subsequent pairs in this GPU process.
-            os.environ['CHANGE_DETECTION_DATA_WORKERS'] = '0'
-            event_queue.put({
-                'type': 'retry',
-                'idx': idx,
-                'stem': stem,
-                'worker': worker_label,
-                'reason': str(inference_error),
-            })
-            _remove_shapefile_dataset(run_output_shp)
-            _remove_file_if_exists(active_tif_path)
-            shutil.rmtree(
-                os.path.join(os.path.dirname(run_output_shp), temp_dir_suffix),
-                ignore_errors=True,
-            )
-            import gc
-            import torch
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            _run_inference(dataloader_workers=0, retry=True)
-        if not os.path.exists(run_output_shp):
-            raise NonFatalTaskWarning(f'变化检测未生成结果文件: {run_output_shp}')
+            try:
+                _run_inference()
+            except RuntimeError as inference_error:
+                if not _is_dataloader_worker_failure(inference_error):
+                    raise
 
-        if pair_scratch_dir is not None:
-            if os.path.exists(active_tif_path):
-                _copy_file_atomically(active_tif_path, tif_dst)
-            _copy_shapefile_dataset(run_output_shp, output_shp)
-        elif os.path.exists(shared_tif_src):
-            shutil.move(shared_tif_src, tif_dst)
+                logger.warning(
+                    'DataLoader worker 异常退出，清理本次未完成输出并以 num_workers=0 重试: %s',
+                    inference_error,
+                )
+                # Keep the fallback for subsequent pairs in this GPU process.
+                os.environ['CHANGE_DETECTION_DATA_WORKERS'] = '0'
+                event_queue.put({
+                    'type': 'retry',
+                    'idx': idx,
+                    'stem': stem,
+                    'worker': worker_label,
+                    'reason': str(inference_error),
+                })
+                _remove_shapefile_dataset(run_output_shp)
+                _remove_file_if_exists(active_tif_path)
+                shutil.rmtree(
+                    os.path.join(os.path.dirname(run_output_shp), temp_dir_suffix),
+                    ignore_errors=True,
+                )
+                import gc
+                import torch
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                _run_inference(dataloader_workers=0, retry=True)
+            if not os.path.exists(run_output_shp):
+                raise NonFatalTaskWarning(f'变化检测未生成结果文件: {run_output_shp}')
+
+            if pair_scratch_dir is not None:
+                if os.path.exists(active_tif_path):
+                    _copy_file_atomically(active_tif_path, tif_dst)
+                _copy_shapefile_dataset(run_output_shp, output_shp)
+            elif os.path.exists(shared_tif_src):
+                shutil.move(shared_tif_src, tif_dst)
 
         if not os.path.exists(output_shp):
             raise NonFatalTaskWarning(f'变化检测结果复制后缺失: {output_shp}')
@@ -816,6 +831,7 @@ def change_detection_folder(pre_folder, post_folder, model_path, dst_path, outpu
             'shp_dir': shp_dir, 'tif_dir': tif_dir, 'dst_path': dst_path,
             'model_path': model_path, 'use_two_models': use_two_models,
             'second_model_path': second_model_path, 'checkpoint_dir': checkpoint_dir,
+            'postprocess_sources': [str(source[1] / 'change_detection_postprocess')] if source else [],
             'checkpoint_identity': pair_identity(pre_path, post_path, run),
         }
         candidates = []

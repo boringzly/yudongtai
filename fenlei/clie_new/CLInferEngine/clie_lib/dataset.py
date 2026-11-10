@@ -148,6 +148,28 @@ class InferDataMgr(data.Dataset):
             except Exception:
                 self.mask_reader = None
 
+    def clone_for_thread(self):
+        # Readers/OGR geometries are private; immutable indices/transforms can be shared.
+        import copy
+        clone = copy.copy(self)
+        clone.image_reader = None
+        clone.mask_reader = None
+        clone.roi = None
+        try:
+            clone.reopen_readers()
+            return clone
+        except BaseException:
+            clone.close()
+            raise
+
+    def close(self):
+        for name in ('image_reader', 'mask_reader'):
+            reader = getattr(self, name, None)
+            if reader is not None:
+                reader.close()
+                setattr(self, name, None)
+        self.roi = None
+
     def __getstate__(self):
         """spawn 模式不序列化 GDAL dataset，由 worker 自行重新打开。"""
         state = self.__dict__.copy()
@@ -178,10 +200,12 @@ class InferDataMgr(data.Dataset):
             _width_down = self.image_reader.width - self.width
 
         status = 'bad'
+        raw_for_output = None
         _retry = 0
         while status == 'bad':
             try:
                 _img = self.image_reader.read_image(read_range=(_width_down, _height_down, self.width, self.height))
+                raw_for_output = _img
                 if self.mask_reader is not None:
                     _mask = self.mask_reader.read_image(read_range=(_width_down, _height_down, self.width, self.height))
                 else:
@@ -265,6 +289,14 @@ class InferDataMgr(data.Dataset):
             img_mask = img_mask * torch.from_numpy(coverage)
             if not np.any(coverage):
                 status = 'outside_roi'
+        exception_value = getattr(self, 'output_exception_value', None)
+        if exception_value is not None:
+            from fenlei.classification_pipeline import prepare_output_exception_mask
+            exception_mask = prepare_output_exception_mask(
+                self.image_reader, raw_for_output, (_width_down, _height_down),
+                idx_i, idx_j, self.height, self.width,
+                self.height - self.height_crop, exception_value)
+            img_mask = {'valid': img_mask, 'exception': exception_mask}
         return img, img_mask, str(idx_i), str(idx_j), status
 
     def __len__(self):

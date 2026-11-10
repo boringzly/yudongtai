@@ -44,22 +44,12 @@ def run_identity(model_file, environ=None):
     models = [model] if model.is_file() else sorted(p for p in model.rglob('*') if p.is_file())
     if not models:
         raise ValueError('分类模型为空')
-    code = hashlib.sha256()
-    sources = [root / 'classification_core.py', root / 'classification_schema.py']
-    sources += sorted((root / 'clie_new').rglob('*.py'))
-    sources += sorted((root / 'clie_new').rglob('*.yaml'))
-    sources += sorted((root / 'clie_new').rglob('*.yml'))
-    for path in sources:
-        code.update(str(path.relative_to(root)).encode())
-        code.update(digest(path).encode())
+    from fenlei.classification_pipeline import code_fingerprint
+    algorithm = code_fingerprint(root)
     roi = None
     if env.get('CHANGE_DETECTION_ROI_VECTOR') or env.get('CHANGE_DETECTION_ROI_WKT_FILE'):
         from change.roi_scope import fingerprint
         roi = fingerprint(env)
-    helper = root.parent / 'change' / 'roi_scope.py'
-    if helper.is_file():
-        code.update(b'change/roi_scope.py')
-        code.update(digest(helper).encode())
     try:
         factor = int(env.get('CLIE_INFER_DOWNSAMPLE', '2'))
     except ValueError:
@@ -69,10 +59,15 @@ def run_identity(model_file, environ=None):
         batch = max(1, min(64, int(env.get('CLIE_BATCH_PER_GPU', '8'))))
     except ValueError:
         batch = 8
-    return {'schema': 1, 'algorithm': code.hexdigest(), 'model_name': model.name,
+    return {'schema': 1, 'algorithm': algorithm, 'model_name': model.name,
             'models': {str(p.relative_to(model)) if model.is_dir() else model.name: digest(p) for p in models},
             'downsample': factor, 'batch_per_gpu': batch,
             'roi': roi, 'vector_wkt': env.get('VECTOR_WKT', ''), 'filter_class_id': env.get('FILTER_CLASS_ID', '')}
+
+
+def _identities_match(saved, current):
+    from fenlei.classification_pipeline import identities_match
+    return identities_match(saved, current, Path(__file__).resolve().parent)
 
 
 def pair_identity(pre, post, mask, run):
@@ -172,7 +167,8 @@ class Checkpoints:
         if path.is_file():
             record = json.loads(path.read_text(encoding='utf-8'))
             if (not isinstance(record, dict) or record.get('status') != 'completed'
-                    or record.get('stem') != stem or record.get('identity') != identity):
+                    or record.get('stem') != stem
+                    or not _identities_match(record.get('identity'), identity)):
                 raise ValueError('完成清单身份不匹配')
             if record.get('sidecars') != sidecar_hashes(shp) or record.get('feature_count') != validate_result(shp):
                 raise ValueError('分类 SHP 内容或图斑数与清单不符')

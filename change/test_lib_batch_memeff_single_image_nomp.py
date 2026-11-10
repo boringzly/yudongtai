@@ -840,7 +840,8 @@ def _resolve_checkpoint_path(module_dir, requested_path, fallback_filename, mode
 
 def test_lib_big_memeff(pre_img_path='', post_img_path='', output_path='', logger=None, callback_url=None, job_id=None,
                         temp_dir_suffix="tmp", progress_callback=None, model_path=None,
-                        use_two_models=False, second_model_path=None, dataloader_workers=None):
+                        use_two_models=False, second_model_path=None, dataloader_workers=None,
+                        postprocess_checkpoint=None):
     """
     主要的推理函数
 
@@ -962,7 +963,8 @@ def test_lib_big_memeff(pre_img_path='', post_img_path='', output_path='', logge
         logger.info("开始推理过程------")
 
     # 每个调用只写当前影像的结果；文件夹模式在外层按 GPU 并行不同影像。
-    test_lib(0, gpu_count, cfg, logger, progress_callback=progress_callback)
+    test_lib(0, gpu_count, cfg, logger, progress_callback=progress_callback,
+             postprocess_checkpoint=postprocess_checkpoint)
 
     # 修改临时目录清理逻辑，使用指定的后缀
     temp_dir_path = Path(os.path.join(cfg.TEST_OUT_PATH, temp_dir_suffix))
@@ -1003,7 +1005,13 @@ def _load_change_model(checkpoint_path, cfg, device):
     return net
 
 
-def test_lib(local_rank, gpu_count, cfg, logger, progress_callback=None):
+def finish_change_vectors(raw_shp, output_shp, roi_wkt, projection, logger=None):
+    from postprocess_checkpoint import finish
+    return finish(raw_shp, output_shp, roi_wkt, projection, fill_hole,
+                  smooth_polygons_gdf_used, clip_shapefile, logger=logger)
+
+
+def test_lib(local_rank, gpu_count, cfg, logger, progress_callback=None, postprocess_checkpoint=None):
     if logger is not None:
         logger.info('test_lib_begin')
     if gpu_count > 0:
@@ -1397,9 +1405,7 @@ def test_lib(local_rank, gpu_count, cfg, logger, progress_callback=None):
 
         shape_dataset = driver.CreateDataSource(out_shp_namelist[n])
         if shape_dataset is None:
-            print('[FATAL] OGR create file failed. [%s]' % out_shp_namelist[n])
-            del out_data
-            continue
+            raise RuntimeError('OGR create file failed: ' + out_shp_namelist[n])
         proj_ref = out_data.GetProjectionRef()
         proj_shp = osr.SpatialReference()
         proj_shp.ImportFromWkt(proj_ref)
@@ -1420,7 +1426,8 @@ def test_lib(local_rank, gpu_count, cfg, logger, progress_callback=None):
         band = out_data.GetRasterBand(1)
         if logger is not None:
             logger.info('polygonize begin')
-        gdal.Polygonize(band, band, layer, 0, [], callback=None)
+        if gdal.Polygonize(band, band, layer, 0, [], callback=None) != 0:
+            raise RuntimeError('Change raster polygonization failed')
         if logger is not None:
             logger.info('polygonize')
 
@@ -1442,35 +1449,21 @@ def test_lib(local_rank, gpu_count, cfg, logger, progress_callback=None):
             feature.SetField("preyear", int(curr_year_value) - 1)
             layer.SetFeature(feature)
 
-        # 检查是否有变化图斑：无变化时保留空的 SHP 文件，供后续分类使用
         feature_count = layer.GetFeatureCount()
-        del shape_dataset
-        del out_data
+        if layer.SyncToDisk() != 0:
+            raise RuntimeError('Cannot flush raw change vectors')
+        # Close every OGR reference before hashing/copying sidecars.
+        feature = layer = shape_dataset = band = out_data = None
         efficiency.phase_done('矢量化及属性写出', vector_started)
-        if feature_count == 0:
+        checkpoint = postprocess_checkpoint
+        if checkpoint:
+            from postprocess_checkpoint import save
+            save(checkpoint['directory'], checkpoint['stem'], checkpoint['identity'],
+                 out_shp_namelist[n], roi_wkt, proj_post)
             if logger is not None:
-                logger.info('未检测到变化图斑，保留空矢量文件供后续分类')
-            # 将空的中间 SHP 复制到最终输出路径，供下游分类使用
-            import shutil as _shutil
-            for ext in ['.shp', '.shx', '.dbf', '.prj', '.cpg']:
-                src = str(Path(out_shp_namelist[0]).with_suffix(ext))
-                dst = str(Path(out_shp_namelist1[0]).with_suffix(ext))
-                if os.path.exists(src):
-                    _shutil.copy2(src, dst)
-            efficiency.finish()
-            continue
-
+                logger.info('[后处理续跑] 已保存原始矢量恢复点 %s，图斑数=%s', checkpoint['stem'], feature_count)
         smooth_started = perf_counter()
-        if logger is not None:
-            logger.info('矢量优化')
-        fill_hole_shp = str(Path(out_shp_namelist[0]).parent / (Path(out_shp_namelist[0]).stem + '_fillhole.shp'))
-        fill_hole(out_shp_namelist[0], fill_hole_shp)
-        output_shp = out_shp_namelist1[0]
-        smooth_polygons_gdf_used(fill_hole_shp, output_shp)
-        if roi_wkt:
-            clip_shapefile(output_shp, roi_wkt, proj_post)
-        if logger is not None:
-            logger.info('矢量优化完成')
+        finish_change_vectors(out_shp_namelist[n], out_shp_namelist1[n], roi_wkt, proj_post, logger)
         efficiency.phase_done('矢量填洞及平滑', smooth_started)
         efficiency.finish()
 

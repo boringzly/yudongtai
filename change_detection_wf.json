@@ -13,7 +13,9 @@
         "classification_resume_from": "",
         "classification_resume_allow_legacy": false,
         "change_prefetch_threads": 2,
-        "change_torch_threads": 4
+        "change_torch_threads": 4,
+        "classification_prefetch_threads": 4,
+        "classification_torch_threads": 4
     },
     "execution_order": [
         "change_detection",

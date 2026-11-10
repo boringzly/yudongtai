@@ -19,10 +19,16 @@ CHANGE_PIPELINE_SETTINGS = {
 }
 
 
-def _apply_change_pipeline_config(config, env):
+CLASSIFICATION_PIPELINE_SETTINGS = {
+    'classification_prefetch_threads': ('CLIE_PREFETCH_THREADS', 0, 8),
+    'classification_torch_threads': ('CLIE_TORCH_THREADS', 1, 256),
+}
+
+
+def _apply_pipeline_config(config, env, settings):
     # Preserve inference defaults when optional fields are absent. Existing env
     # overrides workflow values, matching batch configuration precedence.
-    for key, (env_key, minimum, maximum) in CHANGE_PIPELINE_SETTINGS.items():
+    for key, (env_key, minimum, maximum) in settings.items():
         if env_key in env:
             value, source = env[env_key], env_key
         elif key in config:
@@ -70,6 +76,8 @@ and checkpoint signatures use exactly the same batch. No CUDA imports needed.
         raise ValueError('%s 必须在 1～%s 之间，收到 %s' % (key, maximum, batch))
     env[env_key] = str(batch)
     if stage == 'change':
-        _apply_change_pipeline_config(config, env)
+        _apply_pipeline_config(config, env, CHANGE_PIPELINE_SETTINGS)
+    elif stage == 'classification':
+        _apply_pipeline_config(config, env, CLASSIFICATION_PIPELINE_SETTINGS)
     print('[Batch配置] %s=%s（每张 GPU 的切片数，来源=%s）' % (key, batch, source), flush=True)
     return batch

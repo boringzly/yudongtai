@@ -56,6 +56,12 @@ except:
 prg_sender = None
 
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+from fenlei.classification_pipeline import (
+    ThreadedBatchLoader, configure_cpu_pipeline, managed_batches,
+    ClassificationMetrics, timed_batches, cpu_mask_array,
+)
+from fenlei.classification_runtime import under_hami
 
 
 def _available_cpu_count():
@@ -215,7 +221,7 @@ def resample_to_2m_gdal(image_path):
     if warp_tmp is None:
         raise RuntimeError("重采样失败：GDAL Warp 临时阶段返回 None")
     del warp_tmp
-    
+
     # 4. 将重采样结果再投影回原始投影
     warp_final = gdal.Warp(
         destNameOrDestDS=output_path_final,
@@ -495,7 +501,7 @@ def infer(kwargs):
     if _prg_min_str is not None and _prg_max_str is not None:
         prg_sender.set_progress_range(_prg_min_str, _prg_max_str)
 
-    
+
     if not os.path.exists('./log/'):
         os.mkdir('./log/')
     log_path = os.path.join('./log/', cfg.job_id + '.log')
@@ -515,6 +521,11 @@ def infer(kwargs):
     else:
         cfg.TEST_BATCHES = 1
     data_workers = _recommended_data_workers(num_gpus)
+    prefetch_threads, torch_threads = configure_cpu_pipeline(
+        t, _available_cpu_count(), hami=under_hami(os.environ), environ=os.environ)
+    if prefetch_threads:
+        data_workers = 0  # Never combine CPU thread prefetch with child processes.
+        gdal.SetCacheMax(min(gdal.GetCacheMax(), 512 * 1024 * 1024))
     cfg.PIN_MEMORY = cfg.USE_GPU
 
     local_rank = 0
@@ -777,13 +788,13 @@ def infer(kwargs):
 
         _sub_task_prg_min = prg_sender.calc_progress_value(idx, len(basename_list_list[local_rank]), min_value=_infer_task_prg_min, max_value=_infer_task_prg_max)
         _sub_task_prg_max = prg_sender.calc_progress_value(idx + 1, len(basename_list_list[local_rank]), min_value=_infer_task_prg_min, max_value=_infer_task_prg_max)
-        
+
         basename = basename_list_list[local_rank][idx]
         filename = filename_list_list[local_rank][idx]
-        
+
         filename = resample_to_2m_gdal(filename)
         # filename = clip_and_mask_by_vector(filename)
-        
+
         tqdm.write('[INFO] %s Index: %d / %d' % (time.strftime('[%y%m%d_%H:%M:%S]'), idx + 1, len(basename_list_list[local_rank])))
         tqdm.write('[INFO] %s  Reading: %s' % (time.strftime('[%y%m%d_%H:%M:%S]'), filename))
 
@@ -824,6 +835,11 @@ def infer(kwargs):
         if getattr(test_data, 'roi_wkt', None):
             logger.info('[范围] 分类候选切片=%s, 保留=%s, 范围外跳过=%s（读图之前）' % (
                 test_data.roi_candidates, len(test_data), test_data.roi_candidates - len(test_data)))
+        # This value is copied into each private prefetch dataset before iteration.
+        # Validity uses original pixels, before CLAHE/normalization/padding.
+        test_data.output_exception_value = cfg.EXCEPTION_VALUE
+        logger.info('[分类结果整理配置] cpu_mask=numpy, exception_mask=%s, raw_window_reuse=true' % (
+            'prefetch' if cfg.EXCEPTION_VALUE is not None else 'disabled'))
         dataloader_kwargs = {
             'batch_size': cfg.TEST_BATCHES,
             'shuffle': False,
@@ -840,7 +856,18 @@ def infer(kwargs):
                 'persistent_workers': False,
                 'worker_init_fn': reopen_infer_data_worker,
             })
-        test_dataloader = DataLoader(test_data, **dataloader_kwargs)
+        if prefetch_threads:
+            from torch.utils.data._utils.collate import default_collate
+            test_dataloader = ThreadedBatchLoader(
+                test_data.clone_for_thread, len(test_data), cfg.TEST_BATCHES,
+                prefetch_threads, default_collate)
+        else:
+            test_dataloader = DataLoader(test_data, **dataloader_kwargs)
+        logger.info('[分类数据供给] batch_size=%s, cpu_prefetch_threads=%s, '
+                    'torch_cpu_threads=%s, num_workers=%s, loader=%s, gdal_cache_mb=%s' % (
+                        cfg.TEST_BATCHES, prefetch_threads, torch_threads, data_workers,
+                        'threads' if prefetch_threads else 'DataLoader',
+                        gdal.GetCacheMax() // (1024 * 1024)))
 
         message_dict = {'progress': _sub_task_prg_min, 'runningStatus': 'running', 'runningInfo': '构建文件写出指针'}
         prg_sender.send(message_dict)
@@ -863,7 +890,7 @@ def infer(kwargs):
             try:
                 image_writer_full = ImageWriter(full_out_filename, test_data.image_reader.width,
                                                 test_data.image_reader.height, \
-                                                test_data.image_reader.nbands + 1, compress=cfg.TIFF_COMPRESS)
+                                                test_data.image_reader.nbands + 1, compress=cfg.TIFF_COMPRESS, flush_each_write=False)
                 image_writer_full.set_proj(test_data.image_reader.proj)
                 image_writer_full.set_coord(test_data.image_reader.coord)
                 if cfg.USE_TRANSPARENT_BACKGROUND:
@@ -883,7 +910,7 @@ def infer(kwargs):
             single_out_filename = single_out_root + '/' + basename + output_suffix
             try:
                 image_writer_single = ImageWriter(single_out_filename, test_data.image_reader.width,
-                                                  test_data.image_reader.height, 1, compress=cfg.TIFF_COMPRESS)
+                                                  test_data.image_reader.height, 1, compress=cfg.TIFF_COMPRESS, flush_each_write=False)
                 image_writer_single.set_proj(test_data.image_reader.proj)
                 image_writer_single.set_coord(test_data.image_reader.coord)
                 if cfg.USE_TRANSPARENT_BACKGROUND:
@@ -903,7 +930,7 @@ def infer(kwargs):
             color_out_filename = color_out_root + '/' + basename + output_suffix
             try:
                 image_writer_color = ImageWriter(color_out_filename, test_data.image_reader.width,
-                                                 test_data.image_reader.height, 1, compress=cfg.TIFF_COMPRESS)
+                                                 test_data.image_reader.height, 1, compress=cfg.TIFF_COMPRESS, flush_each_write=False)
                 image_writer_color.set_proj(test_data.image_reader.proj)
                 image_writer_color.set_coord(test_data.image_reader.coord)
                 image_writer_color.set_color_table(color_table)
@@ -930,277 +957,323 @@ def infer(kwargs):
         proj_name = spatial_ref.GetName()
 
         # pbar1 = tqdm(total=len(test_dataloader), bar_format='{l_bar}{bar:30}{r_bar}')
-        for idx_x, (img, img_mask, idx_i, idx_j, status) in enumerate(test_dataloader):
-            logger.setStageAndProcess('影像:' + os.path.basename(filename) + '预测进度', str(100 * (idx_x + 1) / len(test_dataloader)) + '%').info(
-                "预测id:" + str(idx_i) + "_" + str(idx_j))
+        active_writers = tuple(writer for writer in (
+            image_writer_full if cfg.USE_FULL_OUT else None,
+            image_writer_single if cfg.USE_SINGLE_OUT else None,
+            image_writer_color if cfg.USE_COLOR_OUT else None,
+        ) if writer is not None)
+        logger.info('[分类写出配置] flush_mode=batch, tile_log=per_batch, batch_size=%s' % cfg.TEST_BATCHES)
+        metrics = ClassificationMetrics(os.path.basename(filename), cfg.TEST_BATCHES)
+        with managed_batches(test_dataloader) as batch_loader:
+            for idx_x, (img, img_mask, idx_i, idx_j, status) in enumerate(timed_batches(batch_loader, metrics)):
+                prepare_started = time.perf_counter()
+                exception_masks = None
+                if isinstance(img_mask, dict):
+                    exception_masks = cpu_mask_array(img_mask['exception'])
+                    img_mask = img_mask['valid']
+                img_mask = cpu_mask_array(img_mask)
+                logger.setStageAndProcess('影像:' + os.path.basename(filename) + '预测进度', str(100 * (idx_x + 1) / len(test_dataloader)) + '%').info(
+                    "预测id:" + str(idx_i) + "_" + str(idx_j))
 
-            # 初始化预测结果数组
-            pred = np.zeros((len(status), height, width), dtype=np.uint8)
+                # 初始化预测结果数组
+                pred = np.zeros((len(status), height, width), dtype=np.uint8)
 
-            # 找出状态为'good'的索引
-            good_indices = [i for i, s in enumerate(status) if s == 'good']
+                # 找出状态为'good'的索引
+                good_indices = [i for i, s in enumerate(status) if s == 'good']
 
-            if good_indices:  # 只有当存在good状态的切片时才进行预测
-                # Do not overwrite img/img_mask: output grids and source bands stay full size.
-                good_img = _downsample_classification_input(img[good_indices], inference_downsample)
-                if cfg.WITH_TTA:
-                    # TTA预测只对good状态的切片进行
-                    good_img = good_img.data.cpu().numpy().transpose(0, 2, 3, 1)
-                    img_tta_set = tta_encoder.tta(good_img)
-                    for i in range(len(img_tta_set)):
-                        img_tta_set[i] = t.from_numpy(img_tta_set[i].transpose(0, 3, 1, 2))
-
-                    with t.no_grad():
-                        scores_tta = []
+                if good_indices:
+                    good_img = _downsample_classification_input(img[good_indices], inference_downsample)
+                metrics.prepare += time.perf_counter() - prepare_started
+                infer_started = time.perf_counter()
+                if good_indices:  # Existing inference/TTA and output grids are preserved.
+                    if cfg.WITH_TTA:
+                        # TTA预测只对good状态的切片进行
+                        good_img = good_img.data.cpu().numpy().transpose(0, 2, 3, 1)
+                        img_tta_set = tta_encoder.tta(good_img)
                         for i in range(len(img_tta_set)):
-                            data = Variable(img_tta_set[i])
+                            img_tta_set[i] = t.from_numpy(img_tta_set[i].transpose(0, 3, 1, 2))
+
+                        with t.no_grad():
+                            scores_tta = []
+                            for i in range(len(img_tta_set)):
+                                data = Variable(img_tta_set[i])
+                                if cfg.USE_GPU:
+                                    if _USE_DIST:
+                                        data = data.cuda(local_rank, non_blocking=cfg.NON_BLOCKING)
+                                    else:
+                                        data = data.cuda()
+                                scores = model(data)
+                                scores_tta.append(scores.data.cpu().numpy().transpose(0, 2, 3, 1))
+                            scores = tta_decoder.tta(scores_tta)
+                            scores_sum = 0
+                            for i in range(len(scores)):
+                                scores[i] = t.from_numpy(scores[i].transpose(0, 3, 1, 2))
+                                scores_sum += t.sigmoid(scores[i])
+
+                            if cfg.MODEL_NUM_CLASSES > 1:
+                                good_pred = scores_sum.data.max(1)[1].cpu().numpy()
+                            else:
+                                good_pred = scores_sum.data.cpu().numpy()
+                                good_pred = good_pred[:, 0, :, :]
+                                if cfg.USE_BINARY:
+                                    good_pred[good_pred < cfg.THRESHOLD] = 0
+                                    good_pred[good_pred >= cfg.THRESHOLD] = 1
+                                else:
+                                    good_pred *= 255
+                                good_pred = good_pred.astype(np.uint8)
+
+                        # 将good切片的预测结果放回对应位置
+                        for i, orig_idx in enumerate(good_indices):
+                            pred[orig_idx] = _restore_classification_prediction(good_pred[i], height, width)
+
+                    elif cfg.IS_AGRICULTURE_INFER:
+                        # 农业推理只对good状态的切片进行
+                        t1 = time.time()
+                        window_size = cfg.AGRICULTURE_WINDOW_SIZE
+                        good_img = good_img.data.cpu().numpy()
+                        if cfg.TEST_BATCHES != 1:
+                            tqdm.write('[ERROR] THE BATCH OF AGRICULTURE_INFER MUST BE 1')
+                            break
+
+                        agricluture_clip = 4
+                        data_all = img2points_group(good_img, window_size)
+                        img_pred_clip = np.zeros([1, good_img.shape[-2], good_img.shape[-1]], dtype=np.uint8)
+
+                        for i in range(data_all.shape[0] // agricluture_clip):
+                            data = data_all[i * agricluture_clip:(i + 1) * agricluture_clip, :, :, :, :].reshape(
+                                data_all.shape[1] * agricluture_clip, data_all.shape[2], window_size, window_size)
+                            with torch.no_grad():
+                                data = Variable(data)
+                            if cfg.USE_GPU:
+                                data = data.cuda()
+                            if cfg.MODEL_NAME == 'Agriculture':
+                                score = model(data)
+                            else:
+                                score = model(data)[0]
+                            if cfg.MODEL_NUM_CLASSES > 1:
+                                pred_batch = score.data.max(1)[1].cpu().numpy()
+                            else:
+                                pred_batch = torch.sigmoid(score).data.cpu().numpy()
+                                pred_batch = pred_batch[:, 0, :, :]
+                                pred_batch[pred_batch >= cfg.THRESHOLD] = 1
+                                pred_batch[pred_batch < cfg.THRESHOLD] = 0
+                            img_pred_clip[:, i * agricluture_clip:(i + 1) * agricluture_clip, :] = pred_batch.reshape(
+                                agricluture_clip, data_all.shape[1], 1).transpose(2, 0, 1)
+
+                        if (data_all.shape[0] // agricluture_clip * agricluture_clip) != data_all.shape[0]:
+                            data = data_all[(data_all.shape[0] // agricluture_clip * agricluture_clip):, :, :, :, :].view(
+                                data_all.shape[1] * (
+                                            data_all.shape[0] - (data_all.shape[0] // agricluture_clip * agricluture_clip)),
+                                data_all.shape[2], window_size, window_size)
+                            with torch.no_grad():
+                                data = Variable(data)
+                            if cfg.USE_GPU:
+                                data = data.cuda()
+                            if cfg.MODEL_NAME == 'Agriculture':
+                                score = model(data)
+                            else:
+                                score = model(data)[0]
+                            if cfg.MODEL_NUM_CLASSES > 1:
+                                pred_batch = score.data.max(1)[1].cpu().numpy()
+                            else:
+                                pred_batch = torch.sigmoid(score).data.cpu().numpy()
+                                pred_batch = pred_batch[:, 0, :, :]
+                                pred_batch[pred_batch >= cfg.THRESHOLD] = 1
+                                pred_batch[pred_batch < cfg.THRESHOLD] = 0
+                            img_pred_clip[:, (data_all.shape[0] // agricluture_clip * agricluture_clip):,
+                            :] = pred_batch.reshape(
+                                (data_all.shape[0] - (data_all.shape[0] // agricluture_clip * agricluture_clip)),
+                                data_all.shape[1], 1).transpose(2, 0, 1)
+
+                        # 将good切片的预测结果放回对应位置
+                        for i, orig_idx in enumerate(good_indices):
+                            pred[orig_idx] = _restore_classification_prediction(img_pred_clip[i], height, width)
+
+                    else:
+                        # 普通推理只对good状态的切片进行
+                        with t.no_grad():
+                            good_data = Variable(good_img)
                             if cfg.USE_GPU:
                                 if _USE_DIST:
-                                    data = data.cuda(local_rank, non_blocking=cfg.NON_BLOCKING)
+                                    good_data = good_data.cuda(local_rank, non_blocking=cfg.NON_BLOCKING)
                                 else:
-                                    data = data.cuda()
-                            scores = model(data)
-                            scores_tta.append(scores.data.cpu().numpy().transpose(0, 2, 3, 1))
-                        scores = tta_decoder.tta(scores_tta)
-                        scores_sum = 0
-                        for i in range(len(scores)):
-                            scores[i] = t.from_numpy(scores[i].transpose(0, 3, 1, 2))
-                            scores_sum += t.sigmoid(scores[i])
+                                    good_data = good_data.cuda(non_blocking=cfg.NON_BLOCKING)
 
-                        if cfg.MODEL_NUM_CLASSES > 1:
-                            good_pred = scores_sum.data.max(1)[1].cpu().numpy()
-                        else:
-                            good_pred = scores_sum.data.cpu().numpy()
-                            good_pred = good_pred[:, 0, :, :]
-                            if cfg.USE_BINARY:
-                                good_pred[good_pred < cfg.THRESHOLD] = 0
-                                good_pred[good_pred >= cfg.THRESHOLD] = 1
+                            if cfg.TTACH and cfg.FOREGROUND_IDX == 7:
+                                tta_transformes = tta_func.Compose([
+                                    tta_func.Scale(scales=cfg.TTA_SCALE, interpolation='bilinear')
+                                ])
+                                tta_model = tta_func.SegmentationTTAWrapper(model, tta_transformes, merge_mode='mean')
+                                good_score = tta_model(good_data)
                             else:
-                                good_pred *= 255
-                            good_pred = good_pred.astype(np.uint8)
+                                good_score = model(good_data)
 
-                    # 将good切片的预测结果放回对应位置
-                    for i, orig_idx in enumerate(good_indices):
-                        pred[orig_idx] = _restore_classification_prediction(good_pred[i], height, width)
-
-                elif cfg.IS_AGRICULTURE_INFER:
-                    # 农业推理只对good状态的切片进行
-                    t1 = time.time()
-                    window_size = cfg.AGRICULTURE_WINDOW_SIZE
-                    good_img = good_img.data.cpu().numpy()
-                    if cfg.TEST_BATCHES != 1:
-                        tqdm.write('[ERROR] THE BATCH OF AGRICULTURE_INFER MUST BE 1')
-                        break
-
-                    agricluture_clip = 4
-                    data_all = img2points_group(good_img, window_size)
-                    img_pred_clip = np.zeros([1, good_img.shape[-2], good_img.shape[-1]], dtype=np.uint8)
-
-                    for i in range(data_all.shape[0] // agricluture_clip):
-                        data = data_all[i * agricluture_clip:(i + 1) * agricluture_clip, :, :, :, :].reshape(
-                            data_all.shape[1] * agricluture_clip, data_all.shape[2], window_size, window_size)
-                        with torch.no_grad():
-                            data = Variable(data)
-                        if cfg.USE_GPU:
-                            data = data.cuda()
-                        if cfg.MODEL_NAME == 'Agriculture':
-                            score = model(data)
-                        else:
-                            score = model(data)[0]
-                        if cfg.MODEL_NUM_CLASSES > 1:
-                            pred_batch = score.data.max(1)[1].cpu().numpy()
-                        else:
-                            pred_batch = torch.sigmoid(score).data.cpu().numpy()
-                            pred_batch = pred_batch[:, 0, :, :]
-                            pred_batch[pred_batch >= cfg.THRESHOLD] = 1
-                            pred_batch[pred_batch < cfg.THRESHOLD] = 0
-                        img_pred_clip[:, i * agricluture_clip:(i + 1) * agricluture_clip, :] = pred_batch.reshape(
-                            agricluture_clip, data_all.shape[1], 1).transpose(2, 0, 1)
-
-                    if (data_all.shape[0] // agricluture_clip * agricluture_clip) != data_all.shape[0]:
-                        data = data_all[(data_all.shape[0] // agricluture_clip * agricluture_clip):, :, :, :, :].view(
-                            data_all.shape[1] * (
-                                        data_all.shape[0] - (data_all.shape[0] // agricluture_clip * agricluture_clip)),
-                            data_all.shape[2], window_size, window_size)
-                        with torch.no_grad():
-                            data = Variable(data)
-                        if cfg.USE_GPU:
-                            data = data.cuda()
-                        if cfg.MODEL_NAME == 'Agriculture':
-                            score = model(data)
-                        else:
-                            score = model(data)[0]
-                        if cfg.MODEL_NUM_CLASSES > 1:
-                            pred_batch = score.data.max(1)[1].cpu().numpy()
-                        else:
-                            pred_batch = torch.sigmoid(score).data.cpu().numpy()
-                            pred_batch = pred_batch[:, 0, :, :]
-                            pred_batch[pred_batch >= cfg.THRESHOLD] = 1
-                            pred_batch[pred_batch < cfg.THRESHOLD] = 0
-                        img_pred_clip[:, (data_all.shape[0] // agricluture_clip * agricluture_clip):,
-                        :] = pred_batch.reshape(
-                            (data_all.shape[0] - (data_all.shape[0] // agricluture_clip * agricluture_clip)),
-                            data_all.shape[1], 1).transpose(2, 0, 1)
-
-                    # 将good切片的预测结果放回对应位置
-                    for i, orig_idx in enumerate(good_indices):
-                        pred[orig_idx] = _restore_classification_prediction(img_pred_clip[i], height, width)
-
-                else:
-                    # 普通推理只对good状态的切片进行
-                    with t.no_grad():
-                        good_data = Variable(good_img)
-                        if cfg.USE_GPU:
-                            if _USE_DIST:
-                                good_data = good_data.cuda(local_rank, non_blocking=cfg.NON_BLOCKING)
+                            if cfg.MODEL_NUM_CLASSES > 1:
+                                good_pred = torch.argmax(good_score, 1).cpu().numpy()
                             else:
-                                good_data = good_data.cuda(non_blocking=cfg.NON_BLOCKING)
+                                good_score = t.sigmoid(good_score)
+                                good_pred = good_score.data.cpu().numpy()
+                                good_pred = good_pred[:, 0, :, :]
+                                if cfg.USE_BINARY:
+                                    good_pred[good_pred >= cfg.THRESHOLD] = 1
+                                    good_pred[good_pred < cfg.THRESHOLD] = 0
+                                else:
+                                    good_pred *= 255
+                                good_pred = good_pred.astype(np.uint8)
 
-                        if cfg.TTACH and cfg.FOREGROUND_IDX == 7:
-                            tta_transformes = tta_func.Compose([
-                                tta_func.Scale(scales=cfg.TTA_SCALE, interpolation='bilinear')
-                            ])
-                            tta_model = tta_func.SegmentationTTAWrapper(model, tta_transformes, merge_mode='mean')
-                            good_score = tta_model(good_data)
-                        else:
-                            good_score = model(good_data)
-
-                        if cfg.MODEL_NUM_CLASSES > 1:
-                            good_pred = torch.argmax(good_score, 1).cpu().numpy()
-                        else:
-                            good_score = t.sigmoid(good_score)
-                            good_pred = good_score.data.cpu().numpy()
-                            good_pred = good_pred[:, 0, :, :]
-                            if cfg.USE_BINARY:
-                                good_pred[good_pred >= cfg.THRESHOLD] = 1
-                                good_pred[good_pred < cfg.THRESHOLD] = 0
-                            else:
-                                good_pred *= 255
-                            good_pred = good_pred.astype(np.uint8)
-
-                    # 将good切片的预测结果放回对应位置
-                    for i, orig_idx in enumerate(good_indices):
-                        pred[orig_idx] = _restore_classification_prediction(good_pred[i], height, width)
-            #
-            for i in range(pred.shape[0]):
-                if status[i] == 'good':
-                    img_pred = pred[i]
-                else:
-                    img_pred = img_blank
-                img_pred[:, :][img_mask[i] == 0] = 0
-                if cfg.FOREGROUND_IDX > 0:
-                    img_pred[img_pred == 1] = cfg.FOREGROUND_IDX
-                height_down = cfg.PIXEL_OVERLAP // 2
-                height_up = height - cfg.PIXEL_OVERLAP // 2
-                width_down = cfg.PIXEL_OVERLAP // 2
-                width_up = width - cfg.PIXEL_OVERLAP // 2
-                img_pred = img_pred[height_down:height_up, width_down:width_up, None]
-
-                if cfg.FORCE_TO_SIMGLE_CLASS is not None:
-                    if isinstance(cfg.FORCE_TO_SIMGLE_CLASS, list):
-                        for ii in range(cfg.MODEL_NUM_CLASSES + 1):
-                            if ii not in cfg.FORCE_TO_SIMGLE_CLASS:
-                                img_pred[img_pred == ii] = 0
-                            else:
-                                img_pred[img_pred == ii] = cfg.FORCE_TO_SIMGLE_CLASS[0]
+                        # 将good切片的预测结果放回对应位置
+                        for i, orig_idx in enumerate(good_indices):
+                            pred[orig_idx] = _restore_classification_prediction(good_pred[i], height, width)
+                metrics.infer += time.perf_counter() - infer_started
+                write_started = time.perf_counter()
+                for i in range(pred.shape[0]):
+                    output_started = time.perf_counter()
+                    if status[i] == 'good':
+                        img_pred = pred[i]
                     else:
-                        img_pred[img_pred != cfg.FORCE_TO_SIMGLE_CLASS] = 0
-                        # img_pred[img_pred == cfg.FORCE_TO_SIMGLE_CLASS] = 1
+                        img_pred = img_blank
+                    img_pred[:, :][img_mask[i] == 0] = 0
+                    if cfg.FOREGROUND_IDX > 0:
+                        img_pred[img_pred == 1] = cfg.FOREGROUND_IDX
+                    height_down = cfg.PIXEL_OVERLAP // 2
+                    height_up = height - cfg.PIXEL_OVERLAP // 2
+                    width_down = cfg.PIXEL_OVERLAP // 2
+                    width_up = width - cfg.PIXEL_OVERLAP // 2
+                    img_pred = img_pred[height_down:height_up, width_down:width_up, None]
 
-                writer_height_down = int(idx_i[i]) * (height - cfg.PIXEL_OVERLAP)
-                writer_height_up = (int(idx_i[i]) + 1) * (height - cfg.PIXEL_OVERLAP)
-                writer_width_down = int(idx_j[i]) * (width - cfg.PIXEL_OVERLAP)
-                writer_width_up = (int(idx_j[i]) + 1) * (width - cfg.PIXEL_OVERLAP)
-                if writer_height_up > test_data.image_reader.height:
-                    img_pred = img_pred[
-                               :(height - cfg.PIXEL_OVERLAP - writer_height_up + test_data.image_reader.height), :, :]
-                    writer_height_up = test_data.image_reader.height
-                if writer_width_up > test_data.image_reader.width:
-                    img_pred = img_pred[:,
-                               :(width - cfg.PIXEL_OVERLAP - writer_width_up + test_data.image_reader.width), :]
-                    writer_width_up = test_data.image_reader.width
+                    if cfg.FORCE_TO_SIMGLE_CLASS is not None:
+                        if isinstance(cfg.FORCE_TO_SIMGLE_CLASS, list):
+                            for ii in range(cfg.MODEL_NUM_CLASSES + 1):
+                                if ii not in cfg.FORCE_TO_SIMGLE_CLASS:
+                                    img_pred[img_pred == ii] = 0
+                                else:
+                                    img_pred[img_pred == ii] = cfg.FORCE_TO_SIMGLE_CLASS[0]
+                        else:
+                            img_pred[img_pred != cfg.FORCE_TO_SIMGLE_CLASS] = 0
+                            # img_pred[img_pred == cfg.FORCE_TO_SIMGLE_CLASS] = 1
 
-                # import pudb;pu.db
-                if cfg.EXCEPTION_VALUE is not None:
-                    _img = test_data.image_reader.read_image( \
-                            read_range=(writer_width_down, writer_height_down, writer_width_up - writer_width_down, writer_height_up - writer_height_down))
-                    _exp_val = [cfg.EXCEPTION_VALUE] * len(test_data.image_reader.band_list)
-                    _loc = np.all((_img == _exp_val), axis=2)
-                    img_pred[_loc] = 0
+                    writer_height_down = int(idx_i[i]) * (height - cfg.PIXEL_OVERLAP)
+                    writer_height_up = (int(idx_i[i]) + 1) * (height - cfg.PIXEL_OVERLAP)
+                    writer_width_down = int(idx_j[i]) * (width - cfg.PIXEL_OVERLAP)
+                    writer_width_up = (int(idx_j[i]) + 1) * (width - cfg.PIXEL_OVERLAP)
+                    if writer_height_up > test_data.image_reader.height:
+                        img_pred = img_pred[
+                                   :(height - cfg.PIXEL_OVERLAP - writer_height_up + test_data.image_reader.height), :, :]
+                        writer_height_up = test_data.image_reader.height
+                    if writer_width_up > test_data.image_reader.width:
+                        img_pred = img_pred[:,
+                                   :(width - cfg.PIXEL_OVERLAP - writer_width_up + test_data.image_reader.width), :]
+                        writer_width_up = test_data.image_reader.width
 
-                # """dict_vec_temp out"""
-                # if cfg.USE_VEC_TEMP_OUT:
-                #     vec_temp_filename = os.path.join(vec_temp_out_root,
-                #                                      basename + "_" + idx_i[i] + "_" + idx_j[i] + ".shp")
-                #     crop_out = img_pred[:, :, 0]
+                    # import pudb;pu.db
+                    metrics.mask += time.perf_counter() - output_started
+                    exception_started = time.perf_counter()
+                    if exception_masks is not None:
+                        invalid = exception_masks[i, :img_pred.shape[0], :img_pred.shape[1]] != 0
+                        img_pred[invalid] = 0
+                    elif cfg.EXCEPTION_VALUE is not None:
+                        _img = test_data.image_reader.read_image( \
+                                read_range=(writer_width_down, writer_height_down, writer_width_up - writer_width_down, writer_height_up - writer_height_down))
+                        _exp_val = [cfg.EXCEPTION_VALUE] * len(test_data.image_reader.band_list)
+                        _loc = np.all((_img == _exp_val), axis=2)
+                        img_pred[_loc] = 0
 
-                #     geo_info = Utils.get_clip_geoinfo(test_data.image_reader.coord, height - cfg.PIXEL_OVERLAP,
-                #                                       width - cfg.PIXEL_OVERLAP, int(idx_i[i]), int(idx_j[i]))
-                #     dict_vec_temp = '{\n"type": "FeatureCollection",\n"name": "pred",\n"features": [\n'
-                #     dict_vec_temp += ImageUtils.polygonize_mem(crop_out, test_data.image_reader.proj, geo_info,
-                #                                                vec_temp_filename, 1)
-                #     dict_vec_temp += ']\n}\n'
-                    
-                    # 切片数量 切片id 名称 进度
+                    # """dict_vec_temp out"""
+                    # if cfg.USE_VEC_TEMP_OUT:
+                    #     vec_temp_filename = os.path.join(vec_temp_out_root,
+                    #                                      basename + "_" + idx_i[i] + "_" + idx_j[i] + ".shp")
+                    #     crop_out = img_pred[:, :, 0]
 
-                if cfg.USE_FULL_OUT and (image_writer_full is not None):
-                    _img = test_data.image_reader.read_image(
-                        read_range=(writer_width_down, writer_height_down, writer_width_up - writer_width_down,
-                                    writer_height_up - writer_height_down))
-                    _img = np.append(_img, img_pred, axis=2)
-                    image_writer_full.write_image(_img, write_offset=(writer_width_down, writer_height_down))
-                if cfg.USE_SINGLE_OUT and (image_writer_single is not None):
-                    image_writer_single.write_image(img_pred, write_offset=(writer_width_down, writer_height_down))
-                if cfg.USE_COLOR_OUT and (image_writer_color is not None):
-                    image_writer_color.write_image(img_pred, write_offset=(writer_width_down, writer_height_down))
+                    #     geo_info = Utils.get_clip_geoinfo(test_data.image_reader.coord, height - cfg.PIXEL_OVERLAP,
+                    #                                       width - cfg.PIXEL_OVERLAP, int(idx_i[i]), int(idx_j[i]))
+                    #     dict_vec_temp = '{\n"type": "FeatureCollection",\n"name": "pred",\n"features": [\n'
+                    #     dict_vec_temp += ImageUtils.polygonize_mem(crop_out, test_data.image_reader.proj, geo_info,
+                    #                                                vec_temp_filename, 1)
+                    #     dict_vec_temp += ']\n}\n'
 
-                processing_tag = str(int((idx_x+1) / (len(test_dataloader)) * 100)) + '%'
-                total_tag = str((idx / len(basename_list_list[local_rank]) * 100))[:6] + '%'
-                if len(basename_list_list[local_rank]) == 1:
-                    total_tag = processing_tag
-                logger.setStageAndProcess("Process", processing_tag).info(str(idx_x+1) + '/' + str(len(test_dataloader)) + ' ' + idx_i[i] + "_" + idx_j[i]  + ' ' + os.path.basename(filename)  + ' ' + total_tag)
-                if cfg.USE_BLOCK_INFO_OUT:
-                    with open(os.path.join(test_output_root, 'blocks', basename_list_list[local_rank][idx] + '_' + idx_i[i] + "_" + idx_j[i] + '.txt'), 'w') as f:
-                        f.write(str(idx_x+1) + '/' + str(len(test_dataloader)))
+                        # 切片数量 切片id 名称 进度
 
-            x_tl = coord[0] + writer_width_down * coord[1]
-            y_tl = coord[3] + writer_height_down * coord[5]
-            x_tr = coord[0] + (writer_width_down + img_pred.shape[1]) * coord[1]
-            y_tr = coord[3] + writer_height_down * coord[5]
-            x_dl = coord[0] + writer_width_down * coord[1]
-            y_dl = coord[3] + (writer_height_down + img_pred.shape[0]) * coord[5]
-            x_dr = coord[0] + (writer_width_down + img_pred.shape[1]) * coord[1]
-            y_dr = coord[3] + (writer_height_down + img_pred.shape[0]) * coord[5]
-            x1, y1 = x_tl, y_tl
-            x2, y2 = x_tr, y_tr
-            x3, y3 = x_dr, y_dr
-            x4, y4 = x_dl, y_dl
-            '''
-            epsg
-            4326 wgs84
-            3857 web mercator
-            '''
-            _infer_geo_info = None
-            if proj_name in ['WGS 84', 'CGCS2000', 'WGS 84 / Pseudo-Mercator']:
-                if proj_name == 'WGS 84 / Pseudo-Mercator':
-                    x1, y1 = Utils.webmercator_to_lonlat(x1, y1)
-                    x2, y2 = Utils.webmercator_to_lonlat(x2, y2)
-                    x3, y3 = Utils.webmercator_to_lonlat(x3, y3)
-                    x4, y4 = Utils.webmercator_to_lonlat(x4, y4)
-                _infer_geo_info = f'POLYGON(({x1} {y1}, {x2} {y2}, {x3} {y3}, {x4} {y4}, {x1} {y1}))'
-            infer_geo_info = f'[{_infer_geo_info}]'
+                    metrics.exception += time.perf_counter() - exception_started
+                    metrics.output += time.perf_counter() - output_started
+                    raster_started = time.perf_counter()
+                    if cfg.USE_FULL_OUT and (image_writer_full is not None):
+                        _img = test_data.image_reader.read_image(
+                            read_range=(writer_width_down, writer_height_down, writer_width_up - writer_width_down,
+                                        writer_height_up - writer_height_down))
+                        _img = np.append(_img, img_pred, axis=2)
+                        image_writer_full.write_image(_img, write_offset=(writer_width_down, writer_height_down))
+                    if cfg.USE_SINGLE_OUT and (image_writer_single is not None):
+                        image_writer_single.write_image(img_pred, write_offset=(writer_width_down, writer_height_down))
+                    if cfg.USE_COLOR_OUT and (image_writer_color is not None):
+                        image_writer_color.write_image(img_pred, write_offset=(writer_width_down, writer_height_down))
 
-            _prg_idx = prg_sender.calc_progress_value(idx_x + 1, len(test_dataloader), min_value=_sub_task_prg_min, max_value=_sub_task_prg_max)
-            _sub_prg_idx = prg_sender.calc_progress_value(idx_x + 1, len(test_dataloader), min_value=0, max_value=99)
-            message_dict = {'progress': _prg_idx, 'runningStatus': 'running',
-                            'runningInfo': f'分类推理 {os.path.basename(filename)}: {idx_x + 1}/{len(test_dataloader)}批次 ({_sub_prg_idx}%)',
-                            'inferProgress': _sub_prg_idx, 'inferFilename': filename,
-                            'inferBatchCurrent': idx_x + 1, 'inferBatchTotal': len(test_dataloader),
-                            'inferGeoInfo': infer_geo_info}
-            prg_sender.send(message_dict)
+                    metrics.raster += time.perf_counter() - raster_started
+                    output_started = time.perf_counter()
+                    processing_tag = str(int((idx_x+1) / (len(test_dataloader)) * 100)) + '%'
+                    total_tag = str((idx / len(basename_list_list[local_rank]) * 100))[:6] + '%'
+                    if len(basename_list_list[local_rank]) == 1:
+                        total_tag = processing_tag
+                    if i == pred.shape[0] - 1:
+                        logger.setStageAndProcess("Process", processing_tag).info(str(idx_x+1) + '/' + str(len(test_dataloader)) + ' ' + idx_i[i] + "_" + idx_j[i]  + ' ' + os.path.basename(filename)  + ' ' + total_tag)
+                    if cfg.USE_BLOCK_INFO_OUT:
+                        with open(os.path.join(test_output_root, 'blocks', basename_list_list[local_rank][idx] + '_' + idx_i[i] + "_" + idx_j[i] + '.txt'), 'w') as f:
+                            f.write(str(idx_x+1) + '/' + str(len(test_dataloader)))
+
+                    metrics.log += time.perf_counter() - output_started
+                    metrics.output += time.perf_counter() - output_started
+
+                raster_started = time.perf_counter()
+                for writer in active_writers:
+                    writer.flush()
+                metrics.raster += time.perf_counter() - raster_started
+                output_started = time.perf_counter()
+                x_tl = coord[0] + writer_width_down * coord[1]
+                y_tl = coord[3] + writer_height_down * coord[5]
+                x_tr = coord[0] + (writer_width_down + img_pred.shape[1]) * coord[1]
+                y_tr = coord[3] + writer_height_down * coord[5]
+                x_dl = coord[0] + writer_width_down * coord[1]
+                y_dl = coord[3] + (writer_height_down + img_pred.shape[0]) * coord[5]
+                x_dr = coord[0] + (writer_width_down + img_pred.shape[1]) * coord[1]
+                y_dr = coord[3] + (writer_height_down + img_pred.shape[0]) * coord[5]
+                x1, y1 = x_tl, y_tl
+                x2, y2 = x_tr, y_tr
+                x3, y3 = x_dr, y_dr
+                x4, y4 = x_dl, y_dl
+                '''
+                epsg
+                4326 wgs84
+                3857 web mercator
+                '''
+                _infer_geo_info = None
+                if proj_name in ['WGS 84', 'CGCS2000', 'WGS 84 / Pseudo-Mercator']:
+                    if proj_name == 'WGS 84 / Pseudo-Mercator':
+                        x1, y1 = Utils.webmercator_to_lonlat(x1, y1)
+                        x2, y2 = Utils.webmercator_to_lonlat(x2, y2)
+                        x3, y3 = Utils.webmercator_to_lonlat(x3, y3)
+                        x4, y4 = Utils.webmercator_to_lonlat(x4, y4)
+                    _infer_geo_info = f'POLYGON(({x1} {y1}, {x2} {y2}, {x3} {y3}, {x4} {y4}, {x1} {y1}))'
+                infer_geo_info = f'[{_infer_geo_info}]'
+
+                _prg_idx = prg_sender.calc_progress_value(idx_x + 1, len(test_dataloader), min_value=_sub_task_prg_min, max_value=_sub_task_prg_max)
+                _sub_prg_idx = prg_sender.calc_progress_value(idx_x + 1, len(test_dataloader), min_value=0, max_value=99)
+                message_dict = {'progress': _prg_idx, 'runningStatus': 'running',
+                                'runningInfo': f'分类推理 {os.path.basename(filename)}: {idx_x + 1}/{len(test_dataloader)}批次 ({_sub_prg_idx}%)',
+                                'inferProgress': _sub_prg_idx, 'inferFilename': filename,
+                                'inferBatchCurrent': idx_x + 1, 'inferBatchTotal': len(test_dataloader),
+                                'inferGeoInfo': infer_geo_info}
+                metrics.log += time.perf_counter() - output_started
+                metrics.output += time.perf_counter() - output_started
+                message_started = time.perf_counter()
+                prg_sender.send(message_dict)
+                metrics.message += time.perf_counter() - message_started
+
+                metrics.write += time.perf_counter() - write_started
+                metrics.record(len(status), len(good_indices), logger)
+
+        metrics.report(logger, final=True)
 
         logger.setStageAndProcess("Process", '100%').info('完成预测: ' + os.path.basename(filename))
-       
+
         #     pbar1.update(1)
 
         # pbar1.close()
@@ -1289,7 +1362,7 @@ def infer(kwargs):
         prg_sender.send(message_dict)
 
     pbar0.close()
-    
+
     if cfg.USE_SHAPEFILE_OUT:
         # shpsavepath = task_input.split('/')[-2] + '.zip'
         make_zip(shapefile_out_root, os.path.join(test_output_root, f'shp{rank_suffix}.zip'))

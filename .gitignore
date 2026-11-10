@@ -2,3 +2,6 @@
 *.pt
 *.ckpt
 *.so
+/fenlei/classification_pipeline_compat.json
+__pycache__/
+/change/change_resume_compat.json

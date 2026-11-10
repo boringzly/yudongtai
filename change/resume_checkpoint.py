@@ -31,24 +31,8 @@ def file_identity(path):
 
 def run_identity(model_path, use_two_models, second_model_path):
     root = Path(__file__).resolve().parent
-    # Hash inference dependencies, not orchestration/logging, so progress fixes
-    # don't invalidate predictions. Any algorithm/config change must invalidate.
-    sources = [root / 'test_lib_batch_memeff_single_image_nomp.py']
-    if (root / 'inference_pipeline.py').is_file():
-        sources.append(root / 'inference_pipeline.py')
-    if (root / 'roi_scope.py').is_file():
-        sources.append(root / 'roi_scope.py')
-    for directory in ('networks', 'utils'):
-        sources.extend(sorted((root / directory).rglob('*.py')))
-        sources.extend(sorted((root / directory).rglob('*.so')))
-    for name in ('mean_value.txt', 'std_value.txt', 'config.py'):
-        if (root / name).is_file():
-            sources.append(root / name)
-    sources.extend(sorted(root.glob('config*.so')))
-    code = hashlib.sha256()
-    for path in sorted(sources):
-        code.update(str(path.relative_to(root)).encode('utf-8'))
-        code.update(digest(path).encode('ascii'))
+    from resume_compat import code_fingerprint
+    algorithm = code_fingerprint(root)
     models = [digest(resolve_model(model_path, 'FBCD_test_select0207_best_acc.pth'))]
     if use_two_models:
         models.append(digest(resolve_model(second_model_path, 'FBCD_test_Levir_CD_best_acc.pth')))
@@ -58,7 +42,7 @@ def run_identity(model_path, use_two_models, second_model_path):
         from roi_scope import fingerprint
         roi = fingerprint()
     return {'schema': 1, 'models': models, 'dual': bool(use_two_models),
-            'algorithm': code.hexdigest(), 'batch_size': change_batch_size(), 'roi': roi}
+            'algorithm': algorithm, 'batch_size': change_batch_size(), 'roi': roi}
 
 
 def resolve_model(requested, fallback):
@@ -206,7 +190,8 @@ def restore(task, source_step, source_records, legacy, allow_legacy, copy_shp,
             raise ValueError('完成清单格式无效')
         if payload.get('status') != 'completed' or payload.get('stem') != stem:
             raise ValueError('完成清单无效')
-        if payload.get('identity') != task['checkpoint_identity']:
+        from resume_compat import identities_match
+        if not identities_match(payload.get('identity'), task['checkpoint_identity']):
             raise ValueError('输入、模型或推理代码指纹不匹配')
         if payload.get('sidecars') != sidecar_hashes(source):
             raise ValueError('结果文件指纹不匹配')

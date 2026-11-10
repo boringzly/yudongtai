@@ -53,6 +53,20 @@ class WorkflowThreadTests(unittest.TestCase):
         env = self.apply({'change_prefetch_threads': 'invalid'}, stage='classification')
         self.assertNotIn('CHANGE_DETECTION_PREFETCH_THREADS', env)
 
+    def test_classification_pipeline_settings_are_independent(self):
+        env = self.apply({'classification_prefetch_threads': 4, 'classification_torch_threads': 4}, stage='classification')
+        self.assertEqual(env['CLIE_PREFETCH_THREADS'], '4')
+        self.assertEqual(env['CLIE_TORCH_THREADS'], '4')
+        self.assertNotIn('CHANGE_DETECTION_PREFETCH_THREADS', env)
+        env = self.apply({'classification_prefetch_threads': 4}, {'CLIE_PREFETCH_THREADS': '0'}, stage='classification')
+        self.assertEqual(env['CLIE_PREFETCH_THREADS'], '0')
+        env = self.apply({'classification_prefetch_threads': 'invalid'}, stage='change')
+        self.assertNotIn('CLIE_PREFETCH_THREADS', env)
+        for key in ('classification_prefetch_threads', 'classification_torch_threads'):
+            for value in (-1, 300, True, 1.5, None):
+                with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                    self.apply({key: value}, stage='classification')
+
     def test_real_change_entry_exports_settings_before_calling_core(self):
         core = types.ModuleType('change_detection_core')
         captured = {}
